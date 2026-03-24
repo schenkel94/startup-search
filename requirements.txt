@@ -1,0 +1,6 @@
+streamlit
+requests
+pandas
+beautifulsoup4
+playwright==1.58.0
+openpyxl

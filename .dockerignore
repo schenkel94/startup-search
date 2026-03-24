@@ -1,0 +1,11 @@
+__pycache__/
+.git/
+.gitignore
+.venv/
+venv/
+.streamlit_runs/
+.unified_runs/
+*.pyc
+*.pyo
+*.pyd
+*.log

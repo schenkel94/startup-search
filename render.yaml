@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: schenkel-startup-search
+    runtime: docker
+    plan: starter
+    autoDeployTrigger: commit
+    healthCheckPath: /_stcore/health
