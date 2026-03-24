@@ -50,6 +50,16 @@ unimar v360 v4company vitru warren zig contabilizei kiwify bancotoyota adelcoco 
 programmers gruposabe dbservices grupojra proselect elsys frete sidia gpcorpbr talentetech
 contaazul oliveiraeantunes svninvestimentos
 """.split()
+QUICKIN_COMPANIES = [
+    "startse",
+    "topmind",
+    "registradores",
+    "devos",
+    "networksecure",
+    "solupeople",
+    "vagas",
+    "infovagas",
+]
 INCLUDE_DEFAULTS = [
     "analista de dados",
     "data analyst",
@@ -88,6 +98,7 @@ class SearchConfig:
     only_remote: bool
     greenhouse_companies: list[str]
     inhire_companies: list[str]
+    quickin_companies: list[str]
     gupy_pages: int
     inhire_timeout_ms: int
 
@@ -164,6 +175,10 @@ def build_results_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
+def requests_headers() -> dict[str, str]:
+    return {"User-Agent": DEFAULT_USER_AGENT, "Accept": "text/html,application/json"}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_greenhouse(company: str) -> list[dict[str, Any]]:
     url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
@@ -172,6 +187,150 @@ def fetch_greenhouse(company: str) -> list[dict[str, Any]]:
         return []
     response.raise_for_status()
     return response.json().get("jobs", [])
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_quickin_board(slug: str) -> tuple[str, str]:
+    url = f"https://jobs.quickin.io/{slug}/jobs"
+    response = requests.get(url, headers=requests_headers(), timeout=25)
+    response.raise_for_status()
+    return url, response.text
+
+
+def quickin_modality_and_remote(text: str) -> tuple[str, str]:
+    normalized = norm(text)
+    if "remote" in normalized or "remoto" in normalized or "remota" in normalized:
+        return "Remoto", "Sim"
+    if "hybrid" in normalized or "hibrido" in normalized or "hibrida" in normalized:
+        return "Hibrido", "Nao"
+    if "on-site" in normalized or "onsite" in normalized or "presencial" in normalized:
+        return "Presencial", "Nao"
+    return "Nao informado", "Nao informado"
+
+
+def parse_quickin_job_card(card_text: str, title: str) -> tuple[str, str, str]:
+    cleaned = re.sub(r"\s+", " ", card_text or "").strip()
+    title = re.sub(r"\s+", " ", title or "").strip()
+    remainder = cleaned.replace(title, "", 1).strip(" |")
+    modality, remote = quickin_modality_and_remote(remainder)
+
+    location = "Nao informado"
+    if "|" in remainder:
+        parts = [part.strip() for part in remainder.split("|") if part.strip()]
+        if parts:
+            location = parts[-1]
+            if any(token.lower() in {"remote", "hybrid", "on-site"} for token in location.lower().split()):
+                location = parts[0] if len(parts) > 1 else "Nao informado"
+    else:
+        match = re.search(r"(.+?)\s+(Remote|Hybrid|On-site)$", remainder, flags=re.IGNORECASE)
+        if match:
+            location = match.group(1).strip() or "Nao informado"
+        elif remainder:
+            location = remainder
+
+    return location, modality, remote
+
+
+def quickin_pagination_urls(base_url: str, soup: BeautifulSoup) -> list[str]:
+    urls = [base_url]
+    seen = {base_url}
+    for anchor in soup.find_all("a", href=True):
+        href = urllib.parse.urljoin(base_url, anchor.get("href") or "")
+        if "/jobs" not in href:
+            continue
+        if href == base_url:
+            continue
+        if "/jobs/" in href:
+            continue
+        if href not in seen:
+            urls.append(href)
+            seen.add(href)
+    return urls
+
+
+def extract_quickin_jobs_from_html(board_name: str, board_url: str, html: str, include_terms: list[str], exclude_terms: list[str], only_remote: bool) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    rows: list[dict[str, Any]] = []
+    seen_links: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = urllib.parse.urljoin(board_url, anchor.get("href") or "")
+        if "/jobs/" not in href:
+            continue
+
+        title = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip()
+        if not title or not keep_title(title, include_terms, exclude_terms) or href in seen_links:
+            continue
+
+        container = anchor.find_parent(["li", "article", "div", "section"]) or anchor.parent
+        card_text = re.sub(r"\s+", " ", container.get_text(" ", strip=True) if container else title).strip()
+        location, modality, remote = parse_quickin_job_card(card_text, title)
+        if only_remote and remote != "Sim":
+            continue
+
+        rows.append(
+            row(
+                "Quickin",
+                board_name.upper(),
+                title,
+                href,
+                location,
+                modality,
+                remote,
+                "HTML Quickin",
+                pd.NaT,
+            )
+        )
+        seen_links.add(href)
+
+    return rows
+
+
+def search_quickin(config: SearchConfig, tick, on_partial=None) -> tuple[list[dict[str, Any]], list[str]]:
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for company in config.quickin_companies:
+        tick(f"Quickin: {company}")
+        try:
+            board_url, html = fetch_quickin_board(company)
+            soup = BeautifulSoup(html, "html.parser")
+            page_urls = quickin_pagination_urls(board_url, soup)
+            company_rows = extract_quickin_jobs_from_html(
+                board_name=company,
+                board_url=board_url,
+                html=html,
+                include_terms=config.include_terms,
+                exclude_terms=config.exclude_terms,
+                only_remote=config.only_remote,
+            )
+
+            for page_url in page_urls[1:]:
+                try:
+                    response = requests.get(page_url, headers=requests_headers(), timeout=25)
+                    response.raise_for_status()
+                    company_rows.extend(
+                        extract_quickin_jobs_from_html(
+                            board_name=company,
+                            board_url=page_url,
+                            html=response.text,
+                            include_terms=config.include_terms,
+                            exclude_terms=config.exclude_terms,
+                            only_remote=config.only_remote,
+                        )
+                    )
+                except Exception:
+                    continue
+
+            deduped = build_results_df(company_rows).to_dict("records")
+            if deduped:
+                rows.extend(deduped)
+                if on_partial:
+                    on_partial(rows, company.upper())
+        except Exception as exc:
+            warnings.append(f"Quickin falhou para {company}: {exc}")
+
+    return build_results_df(rows).to_dict("records"), warnings
 
 
 def search_greenhouse(config: SearchConfig, tick) -> tuple[list[dict[str, Any]], list[str]]:
@@ -486,6 +645,7 @@ def run_search(config: SearchConfig, live_render=None) -> tuple[pd.DataFrame, li
     steps = max(
         (len(config.greenhouse_companies) if "Greenhouse" in config.sources else 0)
         + (max(1, len(config.include_terms)) if "Gupy" in config.sources else 0)
+        + (len(config.quickin_companies) if "Quickin" in config.sources else 0)
         + (len(config.inhire_companies) if "InHire" in config.sources else 0),
         1,
     )
@@ -504,6 +664,13 @@ def run_search(config: SearchConfig, live_render=None) -> tuple[pd.DataFrame, li
         r, w = search_gupy(config, tick); rows += r; warnings += w
         if live_render and rows:
             live_render(build_results_df(rows), "Gupy")
+    if "Quickin" in config.sources:
+        def render_quickin_partial(quickin_partial_rows: list[dict[str, Any]], stage_label: str) -> None:
+            if live_render:
+                live_render(build_results_df(rows + quickin_partial_rows), f"Quickin {stage_label}")
+        r, w = search_quickin(config, tick, on_partial=render_quickin_partial); rows += r; warnings += w
+        if live_render and rows:
+            live_render(build_results_df(rows), "Quickin")
     if "InHire" in config.sources:
         def render_partial(inhire_partial_rows: list[dict[str, Any]], stage_label: str) -> None:
             if live_render:
@@ -599,7 +766,7 @@ def app() -> None:
     with st.form("search_form"):
         top_left, top_right = st.columns([1.1, 1.35])
         with top_left:
-            sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "InHire"], default=["Greenhouse", "Gupy", "InHire"])
+            sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "Quickin", "InHire"], default=["Greenhouse", "Gupy", "Quickin", "InHire"])
             only_remote = st.toggle("Apenas vagas remotas", value=False)
             gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, 4)
             inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, 12000, step=1000)
@@ -609,9 +776,11 @@ def app() -> None:
             include_raw = st.text_area("Termos de inclusao", value=", ".join(INCLUDE_DEFAULTS), height=110)
             exclude_raw = st.text_area("Termos de exclusao", value=", ".join(EXCLUDE_DEFAULTS), height=110)
 
-        boards_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas InHire"])
+        boards_tab, quickin_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas Quickin", "Empresas InHire"])
         with boards_tab:
             greenhouse_companies = st.multiselect("Selecione os boards", greenhouse_options, default=greenhouse_options)
+        with quickin_tab:
+            quickin_companies = st.multiselect("Selecione as empresas", QUICKIN_COMPANIES, default=QUICKIN_COMPANIES)
         with inhire_tab:
             inhire_companies = st.multiselect("Selecione as empresas", INHIRE_COMPANIES, default=INHIRE_COMPANIES)
 
@@ -629,6 +798,7 @@ def app() -> None:
         only_remote,
         greenhouse_companies,
         inhire_companies,
+        quickin_companies,
         gupy_pages,
         inhire_timeout_ms,
     )
@@ -639,6 +809,8 @@ def app() -> None:
         problems.append("Informe pelo menos um termo de inclusao.")
     if "Greenhouse" in config.sources and not config.greenhouse_companies:
         problems.append("Selecione ao menos um board do Greenhouse.")
+    if "Quickin" in config.sources and not config.quickin_companies:
+        problems.append("Selecione ao menos uma empresa do Quickin.")
     if "InHire" in config.sources and not config.inhire_companies:
         problems.append("Selecione ao menos uma empresa do InHire.")
 
