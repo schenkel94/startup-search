@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
-import subprocess
-import sys
 import unicodedata
 import urllib.parse
-import uuid
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +26,11 @@ except Exception:
 
 
 APP_TITLE = "🕵️Schenkel Startup Search"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+)
+GUPY_MIN_DATE = pd.Timestamp("2026-01-01", tz="UTC")
 GREENHOUSE_COMPANIES = sorted(
     set(
         """
@@ -49,20 +50,6 @@ unimar v360 v4company vitru warren zig contabilizei kiwify bancotoyota adelcoco 
 programmers gruposabe dbservices grupojra proselect elsys frete sidia gpcorpbr talentetech
 contaazul oliveiraeantunes svninvestimentos
 """.split()
-INHIRE_PRIORITY_COMPANIES = [
-    "olist",
-    "contabilizei",
-    "contaazul",
-    "sympla",
-    "warren",
-    "kiwify",
-    "v4company",
-    "zig",
-    "radix",
-    "openlabs",
-    "paytrack",
-    "vitru",
-]
 INCLUDE_DEFAULTS = [
     "analista de dados",
     "data analyst",
@@ -103,8 +90,6 @@ class SearchConfig:
     inhire_companies: list[str]
     gupy_pages: int
     inhire_timeout_ms: int
-    inhire_turbo_mode: bool
-    inhire_priority_batch_size: int
 
 
 def norm(text: str) -> str:
@@ -177,146 +162,6 @@ def build_results_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
             na_position="last",
         ).reset_index(drop=True)
     return df
-
-
-def split_inhire_batches(selected_companies: list[str], turbo_mode: bool, batch_size: int) -> list[tuple[str, list[str]]]:
-    if not selected_companies:
-        return []
-
-    selected_unique = list(dict.fromkeys(selected_companies))
-    priority = [company for company in INHIRE_PRIORITY_COMPANIES if company in selected_unique]
-    others = [company for company in selected_unique if company not in priority]
-
-    if not turbo_mode:
-        return [("lote completo", priority + others)]
-
-    first_batch = priority[:batch_size] if batch_size > 0 else priority
-    remainder = priority[len(first_batch):] + others
-    batches: list[tuple[str, list[str]]] = []
-    if first_batch:
-        batches.append(("lote prioritario", first_batch))
-    if remainder:
-        batches.append(("lote complementar", remainder))
-    return batches or [("lote completo", selected_unique)]
-
-
-def map_inhire_df_to_rows(df: pd.DataFrame, exclude_terms: list[str]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for _, item in df.iterrows():
-        title = str(item.get("nome_vaga") or "").strip()
-        if not title or has_term(title, exclude_terms):
-            continue
-        out.append(
-            row(
-                "InHire",
-                str(item.get("empresa") or "").strip().upper(),
-                title,
-                str(item.get("link") or "").strip(),
-                "Nao informado",
-                "N/A",
-                "N/A",
-                f"InHire {str(item.get('origem_extracao') or 'cli').strip()}",
-                pd.NaT,
-            )
-        )
-    return out
-
-
-def run_inhire_inline_batch(companies: list[str], include_terms: list[str], exclude_terms: list[str], timeout_ms: int) -> tuple[list[dict[str, Any]], list[str]]:
-    if not PLAYWRIGHT_READY or sync_playwright is None:
-        return [], ["InHire indisponivel: Playwright nao esta instalado neste ambiente."]
-
-    warnings: list[str] = []
-    rows: list[dict[str, Any]] = []
-
-    try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--disable-infobars",
-                ],
-            )
-            context = browser.new_context(
-                locale="pt-BR",
-                user_agent="Mozilla/5.0",
-                viewport={"width": 1440, "height": 900},
-            )
-            context.route(
-                "**/*",
-                lambda route, request: route.abort()
-                if request.resource_type in {"image", "font", "media"}
-                else route.continue_(),
-            )
-
-            try:
-                for company in companies:
-                    page = context.new_page()
-                    payloads: list[Any] = []
-
-                    def capture(response) -> None:
-                        try:
-                            if response.request.resource_type not in {"xhr", "fetch"}:
-                                return
-                            if "json" not in response.headers.get("content-type", "").lower():
-                                return
-                            payloads.append(response.json())
-                        except Exception:
-                            return
-
-                    page.on("response", capture)
-
-                    try:
-                        listing_url = f"https://{company}.inhire.app/vagas"
-                        page.goto(listing_url, timeout=60000, wait_until="domcontentloaded")
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=5000)
-                        except PlaywrightTimeout:
-                            pass
-
-                        page.wait_for_timeout(700)
-                        selectors = ["a[href*='/vagas/']", "[class*='job']", "[class*='vaga']", "[class*='card']", "main"]
-                        for selector in selectors:
-                            try:
-                                page.wait_for_selector(selector, timeout=timeout_ms)
-                                break
-                            except PlaywrightTimeout:
-                                continue
-
-                        html = page.content()
-                        found = inhire_candidates(page, html, listing_url, include_terms, payloads)
-                        for item in found:
-                            if has_term(item["title"], exclude_terms):
-                                continue
-                            rows.append(
-                                row(
-                                    "InHire",
-                                    company.upper(),
-                                    item["title"],
-                                    item["link"],
-                                    "Nao informado",
-                                    "N/A",
-                                    "N/A",
-                                    f"InHire {item['origin']}",
-                                    pd.NaT,
-                                )
-                            )
-                    except Exception as exc:
-                        warnings.append(f"InHire falhou para {company}: {exc}")
-                    finally:
-                        page.close()
-            finally:
-                browser.close()
-    except Exception as exc:
-        message = str(exc)
-        if "Executable doesn't exist" in message or "browserType.launch" in message:
-            warnings.append("InHire indisponivel: navegador do Playwright nao encontrado. Rode 'python -m playwright install chromium'.")
-        else:
-            warnings.append(f"InHire falhou ao iniciar o fallback interno: {exc}")
-
-    return build_results_df(rows).to_dict("records"), warnings
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -408,12 +253,15 @@ def search_gupy(config: SearchConfig, tick) -> tuple[list[dict[str, Any]], list[
             link = (job.get("jobUrl") or f"https://portal.gupy.io/jobs/{job.get('id')}").strip()
             if not title or not link or link in seen or not keep_title(title, config.include_terms, config.exclude_terms):
                 continue
+            published_date = parse_date(job.get("publishedDate"))
+            if pd.isna(published_date) or published_date < GUPY_MIN_DATE:
+                continue
             modal, remote = gupy_modal(job)
             if config.only_remote and remote != "Sim":
                 continue
             seen.add(link)
             location = ", ".join([part.strip() for part in [job.get("city"), job.get("state")] if isinstance(part, str) and part.strip()]) or "Nao informado"
-            out.append(row("Gupy", str(job.get("careerPageName") or "Gupy").upper(), title, link, location, modal, remote, "API Gupy", parse_date(job.get("publishedDate"))))
+            out.append(row("Gupy", str(job.get("careerPageName") or "Gupy").upper(), title, link, location, modal, remote, "API Gupy", published_date))
     return out, warnings
 
 
@@ -493,96 +341,122 @@ def inhire_candidates(page, html: str, listing_url: str, include_terms: list[str
     return deduped
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def run_inhire_cli_cached(companies: tuple[str, ...], keywords: tuple[str, ...], timeout_ms: int) -> tuple[pd.DataFrame, int, str]:
-    app_dir = Path(__file__).resolve().parent
-    script_path = app_dir / "inhire.py"
-    if not script_path.exists():
-        raise FileNotFoundError(f"Arquivo nao encontrado: {script_path}")
-    runs_dir = app_dir / ".unified_runs"
-    run_dir = runs_dir / uuid.uuid4().hex
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    command = [
-        sys.executable,
-        str(script_path),
-        "--cli-run",
-        "--output-dir",
-        str(run_dir),
-        "--timeout-ms",
-        str(timeout_ms),
-    ]
-    for company in companies:
-        command.extend(["--company", company])
-    for keyword in keywords:
-        command.extend(["--keyword", keyword])
-
-    try:
-        result = subprocess.run(
-            command,
-            cwd=app_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        csv_files = sorted(run_dir.glob("vagas_*.csv"))
-        df = pd.read_csv(csv_files[-1]) if csv_files else pd.DataFrame(columns=["empresa", "nome_vaga", "link", "origem_extracao"])
-        output = "\n".join(chunk.strip() for chunk in [result.stdout, result.stderr] if chunk and chunk.strip())
-        return df, result.returncode, output
-    finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
-
-
 def search_inhire(config: SearchConfig, tick, on_partial=None) -> tuple[list[dict[str, Any]], list[str]]:
     if not config.inhire_companies:
         return [], []
-
-    batches = split_inhire_batches(
-        config.inhire_companies,
-        config.inhire_turbo_mode,
-        config.inhire_priority_batch_size,
-    )
-    if not batches:
-        return [], []
+    if not PLAYWRIGHT_READY or sync_playwright is None:
+        return [], ["InHire indisponivel: Playwright nao esta instalado neste ambiente."]
 
     collected_rows: list[dict[str, Any]] = []
     warnings: list[str] = []
-    for batch_name, companies in batches:
-        tick(f"InHire: {batch_name} ({len(companies)} empresas)")
-        batch_rows: list[dict[str, Any]] = []
-        try:
-            df, return_code, output = run_inhire_cli_cached(
-                tuple(companies),
-                tuple(config.include_terms),
-                config.inhire_timeout_ms,
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                ],
             )
-            if return_code != 0:
-                message = output or "Erro sem detalhes no subprocesso do InHire."
-                if "Executable doesn't exist" in message or "browserType.launch" in message:
-                    message = "InHire indisponivel: navegador do Playwright nao encontrado. Rode 'python -m playwright install chromium'."
-                warnings.append(message)
-                continue
-            batch_rows = map_inhire_df_to_rows(df, config.exclude_terms)
-        except Exception as exc:
-            fallback_rows, fallback_warnings = run_inhire_inline_batch(
-                companies=companies,
-                include_terms=config.include_terms,
-                exclude_terms=config.exclude_terms,
-                timeout_ms=config.inhire_timeout_ms,
+            context = browser.new_context(
+                locale="pt-BR",
+                user_agent=DEFAULT_USER_AGENT,
+                viewport={"width": 1440, "height": 900},
             )
-            batch_rows = fallback_rows
-            if fallback_warnings:
-                warnings.extend(fallback_warnings)
-            else:
-                warnings.append(f"InHire rodou no modo interno para {batch_name} apos falha no scraper dedicado: {exc}")
+            context.route(
+                "**/*",
+                lambda route, request: route.abort()
+                if request.resource_type in {"image", "font", "media"}
+                else route.continue_(),
+            )
+            context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = window.chrome || { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                """
+            )
 
-        collected_rows.extend(batch_rows)
+            try:
+                for company in config.inhire_companies:
+                    tick(f"InHire: {company}")
+                    page = context.new_page()
+                    payloads: list[Any] = []
 
-        if on_partial and batch_rows:
-            on_partial(collected_rows, batch_name)
+                    def capture(response) -> None:
+                        try:
+                            if response.request.resource_type not in {"xhr", "fetch"}:
+                                return
+                            if "json" not in response.headers.get("content-type", "").lower():
+                                return
+                            payloads.append(response.json())
+                        except Exception:
+                            return
 
-    return collected_rows, warnings
+                    page.on("response", capture)
+
+                    try:
+                        listing_url = f"https://{company}.inhire.app/vagas"
+                        page.goto(listing_url, timeout=60000, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except PlaywrightTimeout:
+                            pass
+
+                        page.wait_for_timeout(500)
+                        for _ in range(2):
+                            page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.9))")
+                            page.wait_for_timeout(300)
+                        page.evaluate("window.scrollTo(0, 0)")
+                        page.wait_for_timeout(250)
+
+                        selectors = ["a[href*='/vagas/']", "[class*='job']", "[class*='vaga']", "[class*='card']", "main"]
+                        for selector in selectors:
+                            try:
+                                page.wait_for_selector(selector, timeout=config.inhire_timeout_ms)
+                                break
+                            except PlaywrightTimeout:
+                                continue
+
+                        html = page.content()
+                        company_rows: list[dict[str, Any]] = []
+                        for item in inhire_candidates(page, html, listing_url, config.include_terms, payloads):
+                            if has_term(item["title"], config.exclude_terms):
+                                continue
+                            company_rows.append(
+                                row(
+                                    "InHire",
+                                    company.upper(),
+                                    item["title"],
+                                    item["link"],
+                                    "Nao informado",
+                                    "N/A",
+                                    "N/A",
+                                    f"InHire {item['origin']}",
+                                    pd.NaT,
+                                )
+                            )
+                        if company_rows:
+                            collected_rows.extend(company_rows)
+                            if on_partial:
+                                on_partial(collected_rows, company.upper())
+                    except Exception as exc:
+                        warnings.append(f"InHire falhou para {company}: {exc}")
+                    finally:
+                        page.close()
+            finally:
+                browser.close()
+    except Exception as exc:
+        message = str(exc)
+        if "Executable doesn't exist" in message or "browserType.launch" in message:
+            warnings.append("InHire indisponivel: navegador do Playwright nao encontrado. Rode 'python -m playwright install chromium'.")
+        else:
+            warnings.append(f"InHire falhou ao iniciar: {exc}")
+
+    return build_results_df(collected_rows).to_dict("records"), warnings
 
 
 def render_progress_results(df: pd.DataFrame, stage_label: str, final: bool = False) -> None:
@@ -591,11 +465,17 @@ def render_progress_results(df: pd.DataFrame, stage_label: str, final: bool = Fa
             st.info("Nenhuma vaga encontrada com os filtros atuais.")
         return
 
-    label = "Resultados finais" if final else f"Resultados parciais apos {stage_label}"
-    st.markdown(f"### {label}")
-    st.caption(f"{len(df)} vagas carregadas ate agora.")
+    label = "Resultados finais" if final else f"Fluxo ao vivo apos {stage_label}"
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        stat("Vagas", str(len(df)), "Carregadas ate agora")
+    with col2:
+        stat("Empresas", str(df["Empresa"].nunique()), "Com resultado parcial")
+    with col3:
+        st.markdown(f"### {label}")
+        st.caption("A lista vai sendo enriquecida conforme cada fonte termina ou o InHire fecha uma empresa.")
     st.dataframe(
-        df[["Fonte", "Empresa", "Vaga", "Remoto?", "Origem da coleta", "Link"]],
+        df[["Fonte", "Empresa", "Vaga", "Data", "Remoto?", "Origem da coleta", "Link"]],
         hide_index=True,
         use_container_width=True,
         column_config={"Link": st.column_config.LinkColumn("Link", display_text="Abrir vaga")},
@@ -606,7 +486,7 @@ def run_search(config: SearchConfig, live_render=None) -> tuple[pd.DataFrame, li
     steps = max(
         (len(config.greenhouse_companies) if "Greenhouse" in config.sources else 0)
         + (max(1, len(config.include_terms)) if "Gupy" in config.sources else 0)
-        + (len(split_inhire_batches(config.inhire_companies, config.inhire_turbo_mode, config.inhire_priority_batch_size)) if "InHire" in config.sources else 0),
+        + (len(config.inhire_companies) if "InHire" in config.sources else 0),
         1,
     )
     progress, label, count = st.progress(0.0), st.empty(), 0
@@ -640,14 +520,17 @@ def apply_theme() -> None:
     st.markdown(
         """
         <style>
-        .stApp { background: radial-gradient(circle at top left, rgba(232,244,255,.95), transparent 26%), radial-gradient(circle at top right, rgba(255,232,214,.92), transparent 24%), linear-gradient(180deg, #f4efe7 0%, #f8f7f3 100%); }
-        .block-container { max-width: 1200px; padding-top: 1.5rem; padding-bottom: 2rem; }
+        .stApp { background: linear-gradient(180deg, #f3eee3 0%, #f7f6f1 45%, #f3efe7 100%); color: #173047; }
+        .block-container { max-width: 1220px; padding-top: 1.25rem; padding-bottom: 2rem; }
+        header[data-testid="stHeader"] { background: transparent; }
+        #MainMenu { visibility: hidden; }
         h1, h2, h3 { font-family: "Palatino Linotype", Georgia, serif; letter-spacing: -.02em; }
-        .hero, .card, .job { background: rgba(255,255,255,.85); border: 1px solid rgba(24,50,75,.08); box-shadow: 0 16px 36px rgba(36,55,76,.08); border-radius: 24px; }
-        .hero { padding: 1.8rem 2rem; margin-bottom: 1rem; }
-        .eyebrow { color: #a0542b; text-transform: uppercase; letter-spacing: .16em; font-size: .76rem; font-weight: 700; }
-        .hero h1 { color: #18324b; margin: .4rem 0; font-size: 2.3rem; }
-        .hero p { color: #42566c; max-width: 760px; line-height: 1.6; }
+        .hero, .card, .job, .control-shell { background: rgba(255,255,255,.82); border: 1px solid rgba(24,50,75,.08); box-shadow: 0 18px 44px rgba(36,55,76,.08); border-radius: 28px; }
+        .hero { padding: 2rem 2.1rem; margin-bottom: 1rem; background: linear-gradient(135deg, rgba(255,255,255,.92), rgba(247,240,229,.92)); }
+        .eyebrow { color: #8f532d; text-transform: uppercase; letter-spacing: .16em; font-size: .76rem; font-weight: 700; }
+        .hero h1 { color: #18324b; margin: .35rem 0 .55rem; font-size: 2.45rem; }
+        .hero p { color: #42566c; max-width: 760px; line-height: 1.65; font-size: 1rem; }
+        .control-shell { padding: 1.25rem 1.35rem; margin-bottom: 1rem; }
         .card { padding: 1rem 1.1rem; min-height: 110px; }
         .label { color: #6c7b89; text-transform: uppercase; letter-spacing: .12em; font-size: .78rem; }
         .value { color: #18324b; font-size: 1.7rem; font-weight: 700; }
@@ -659,6 +542,7 @@ def apply_theme() -> None:
         .source { background:#e6eff8; color:#244968; } .yes { background:#e7f7ee; color:#1d6b3e; } .no { background:#f6eadf; color:#925227; } .na { background:#eef1f4; color:#556574; }
         .meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:.75rem; margin-top:.65rem; }
         .meta strong { display:block; color:#7a8794; text-transform:uppercase; font-size:.72rem; letter-spacing:.08em; margin-bottom:.1rem; }
+        div[data-testid="stTextArea"], div[data-testid="stMultiSelect"], div[data-testid="stNumberInput"], div[data-testid="stSelectbox"], div[data-testid="stSlider"] { background: rgba(255,255,255,.55); border-radius: 18px; padding: .25rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -671,7 +555,7 @@ def hero() -> None:
         <section class="hero">
             <div class="eyebrow">Busca avancada para area de dados</div>
             <h1>🕵️Schenkel Startup Search</h1>
-            <p>Consolide a busca de vagas em uma so interface, com foco em startups, filtros de palavras, indicacao da fonte, modalidade remota quando houver e atualizacao progressiva conforme cada fonte termina.</p>
+            <p>Um radar unico para encontrar vagas em startups com menos atrito, mais contexto e uma fila viva de oportunidades enquanto a busca ainda esta rodando.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -711,23 +595,32 @@ def app() -> None:
     hero()
 
     greenhouse_options = sorted(set(GREENHOUSE_COMPANIES + load_extra_greenhouse_companies()))
-    with st.sidebar:
-        st.header("Filtros")
-        sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "InHire"], default=["Greenhouse", "Gupy", "InHire"])
-        include_raw = st.text_area("Termos de inclusao", value=", ".join(INCLUDE_DEFAULTS))
-        exclude_raw = st.text_area("Termos de exclusao", value=", ".join(EXCLUDE_DEFAULTS))
-        only_remote = st.toggle("Apenas vagas remotas", value=False)
-        with st.expander("Greenhouse", expanded=True):
-            greenhouse_companies = st.multiselect("Boards Greenhouse", greenhouse_options, default=greenhouse_options)
-        with st.expander("Gupy", expanded=True):
-            gupy_pages = st.slider("Paginas por termo", 1, 8, 4)
-        with st.expander("InHire", expanded=False):
-            inhire_companies = st.multiselect("Empresas InHire", INHIRE_COMPANIES, default=INHIRE_COMPANIES)
+    st.markdown('<section class="control-shell">', unsafe_allow_html=True)
+    with st.form("search_form"):
+        top_left, top_right = st.columns([1.1, 1.35])
+        with top_left:
+            sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "InHire"], default=["Greenhouse", "Gupy", "InHire"])
+            only_remote = st.toggle("Apenas vagas remotas", value=False)
+            gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, 4)
             inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, 12000, step=1000)
-            inhire_turbo_mode = st.toggle("Modo InHire turbo", value=True)
-            inhire_priority_batch_size = st.slider("Empresas prioritarias primeiro", 3, 12, 8)
-            st.caption("No modo turbo, as startups mais fortes do InHire rodam primeiro e a app mostra uma previa parcial antes do restante.")
-            st.caption("InHire nao informa remoto na listagem, entao a coluna fica como N/A.")
+            st.caption("A Gupy agora so considera vagas publicadas em 2026 ou depois.")
+            st.caption("No InHire, vagas sem info de remoto continuam aparecendo com modalidade N/A.")
+        with top_right:
+            include_raw = st.text_area("Termos de inclusao", value=", ".join(INCLUDE_DEFAULTS), height=110)
+            exclude_raw = st.text_area("Termos de exclusao", value=", ".join(EXCLUDE_DEFAULTS), height=110)
+
+        boards_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas InHire"])
+        with boards_tab:
+            greenhouse_companies = st.multiselect("Selecione os boards", greenhouse_options, default=greenhouse_options)
+        with inhire_tab:
+            inhire_companies = st.multiselect("Selecione as empresas", INHIRE_COMPANIES, default=INHIRE_COMPANIES)
+
+        left, right = st.columns([1, 2])
+        with left:
+            clicked = st.form_submit_button("Buscar vagas agora", type="primary", use_container_width=True)
+        with right:
+            st.caption("Os resultados entram em tela conforme cada fonte termina. No InHire, a alimentacao acontece empresa por empresa.")
+    st.markdown("</section>", unsafe_allow_html=True)
 
     config = SearchConfig(
         sources,
@@ -738,8 +631,6 @@ def app() -> None:
         inhire_companies,
         gupy_pages,
         inhire_timeout_ms,
-        inhire_turbo_mode,
-        inhire_priority_batch_size,
     )
     problems = []
     if not config.sources:
@@ -751,18 +642,12 @@ def app() -> None:
     if "InHire" in config.sources and not config.inhire_companies:
         problems.append("Selecione ao menos uma empresa do InHire.")
 
-    left, right = st.columns([1, 2])
-    with left:
-        clicked = st.button("Buscar vagas agora", type="primary", use_container_width=True)
-    with right:
-        st.caption("A tabela final mostra fonte, origem da coleta, modalidade e indicador de remoto. No InHire, o filtro remoto nao exclui vagas com modalidade N/A.")
-
     if problems:
         for problem in problems:
             st.error(problem)
         return
     if not clicked:
-        st.info("Ajuste os filtros e clique em 'Buscar vagas agora' para gerar a busca unificada.")
+        st.info("Escolha as fontes, refine os termos e rode a busca. A lista vai sendo atualizada na tela sem precisar esperar tudo terminar.")
         return
 
     results_placeholder = st.empty()
@@ -813,11 +698,11 @@ def app() -> None:
                 use_container_width=True,
             )
 
-        table_tab, cards_tab = st.tabs(["Tabela", "Cards"])
+        feed_tab, table_tab = st.tabs(["Feed", "Tabela completa"])
+        with feed_tab:
+            show_cards(flat_df)
         with table_tab:
             st.dataframe(flat_df, hide_index=True, use_container_width=True, column_config={"Link": st.column_config.LinkColumn("Link", display_text="Abrir vaga")})
-        with cards_tab:
-            show_cards(flat_df)
 
 
 if __name__ == "__main__":
