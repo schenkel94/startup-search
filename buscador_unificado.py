@@ -59,6 +59,8 @@ QUICKIN_COMPANIES = [
     "solupeople",
     "vagas",
     "infovagas",
+    "qintess",
+    "sinqia"
 ]
 INCLUDE_DEFAULTS = [
     "analista de dados",
