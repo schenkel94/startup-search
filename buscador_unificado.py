@@ -13,7 +13,16 @@ from typing import Any
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
+
+try:
+    from streamlit_local_storage import LocalStorage
+
+    LOCAL_STORAGE_READY = True
+except Exception:
+    LocalStorage = None
+    LOCAL_STORAGE_READY = False
 
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -125,11 +134,10 @@ def parse_terms(raw: str) -> list[str]:
     return list(dict.fromkeys([x for x in items if x]))
 
 
-def merge_company_selection(selected: list[str], additions_raw: str, removals_raw: str) -> list[str]:
+def merge_company_selection(selected: list[str], additions_raw: str) -> list[str]:
     additions = parse_terms(additions_raw)
-    removals = set(parse_terms(removals_raw))
     merged = list(dict.fromkeys([*selected, *additions]))
-    return [item for item in merged if item not in removals]
+    return [item for item in merged if item]
 
 
 def cleaned_company_options(items: list[str]) -> list[str]:
@@ -242,6 +250,285 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("show_only_saved", False)
     st.session_state.setdefault("show_hidden_jobs", False)
     st.session_state.setdefault("active_runtime", None)
+    st.session_state.setdefault("saved_searches", {})
+    st.session_state.setdefault("saved_search_choice", "")
+    st.session_state.setdefault("saved_search_name", "")
+    st.session_state.setdefault("form_state_initialized", False)
+    st.session_state.setdefault("search_history", [])
+    st.session_state.setdefault("browser_storage_loaded", False)
+    st.session_state.setdefault("cookie_notice_accepted", False)
+    st.session_state.setdefault("storage_sync_counter", 0)
+    st.session_state.setdefault("storage_last_synced", -1)
+
+
+def form_state_defaults() -> dict[str, Any]:
+    greenhouse_defaults = cleaned_company_options(GREENHOUSE_COMPANIES + load_extra_greenhouse_companies())
+    quickin_defaults = cleaned_company_options(QUICKIN_COMPANIES)
+    inhire_defaults = cleaned_company_options(INHIRE_COMPANIES)
+    return {
+        "sources_widget": ["Greenhouse", "Gupy", "Quickin", "InHire"],
+        "only_remote_widget": False,
+        "gupy_pages_widget": 4,
+        "inhire_timeout_widget": 12000,
+        "include_unknown_locations_widget": False,
+        "include_raw_widget": ", ".join(INCLUDE_DEFAULTS),
+        "exclude_raw_widget": ", ".join(EXCLUDE_DEFAULTS),
+        "location_raw_widget": "",
+        "greenhouse_selected_widget": greenhouse_defaults,
+        "greenhouse_add_raw_widget": "",
+        "quickin_selected_widget": quickin_defaults,
+        "quickin_add_raw_widget": "",
+        "inhire_selected_widget": inhire_defaults,
+        "inhire_add_raw_widget": "",
+    }
+
+
+def parse_query_csv(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        value = ",".join(value)
+    return parse_terms(value)
+
+
+def load_form_state_from_query_params() -> dict[str, Any]:
+    defaults = form_state_defaults()
+    params = st.query_params
+
+    def get_bool(key: str, default: bool) -> bool:
+        value = params.get(key)
+        if value is None:
+            return default
+        return str(value).lower() in {"1", "true", "yes", "on"}
+
+    def get_int(key: str, default: int) -> int:
+        value = params.get(key)
+        try:
+            return int(str(value)) if value is not None else default
+        except Exception:
+            return default
+
+    state = defaults.copy()
+    if params.get("sources"):
+        state["sources_widget"] = [item for item in str(params.get("sources")).split(",") if item]
+    if params.get("include"):
+        state["include_raw_widget"] = str(params.get("include")).replace(",", ", ")
+    if params.get("exclude"):
+        state["exclude_raw_widget"] = str(params.get("exclude")).replace(",", ", ")
+    if params.get("location"):
+        state["location_raw_widget"] = str(params.get("location")).replace(",", ", ")
+
+    state["only_remote_widget"] = get_bool("only_remote", defaults["only_remote_widget"])
+    state["include_unknown_locations_widget"] = get_bool("include_unknown_locations", defaults["include_unknown_locations_widget"])
+    state["gupy_pages_widget"] = max(1, min(8, get_int("gupy_pages", defaults["gupy_pages_widget"])))
+    state["inhire_timeout_widget"] = max(5000, min(30000, get_int("inhire_timeout", defaults["inhire_timeout_widget"])))
+
+    for key, param_name in [
+        ("greenhouse_selected_widget", "gh"),
+        ("quickin_selected_widget", "quickin"),
+        ("inhire_selected_widget", "inhire"),
+    ]:
+        parsed = parse_query_csv(params.get(param_name))
+        if parsed:
+            state[key] = parsed
+
+    return state
+
+
+def hydrate_form_state_from_query() -> None:
+    if st.session_state.get("form_state_initialized"):
+        return
+    state = load_form_state_from_query_params()
+    for key, value in state.items():
+        st.session_state[key] = value
+    st.session_state.form_state_initialized = True
+
+
+def current_form_state() -> dict[str, Any]:
+    return {
+        "sources_widget": st.session_state.get("sources_widget", []),
+        "only_remote_widget": st.session_state.get("only_remote_widget", False),
+        "gupy_pages_widget": st.session_state.get("gupy_pages_widget", 4),
+        "inhire_timeout_widget": st.session_state.get("inhire_timeout_widget", 12000),
+        "include_unknown_locations_widget": st.session_state.get("include_unknown_locations_widget", False),
+        "include_raw_widget": st.session_state.get("include_raw_widget", ""),
+        "exclude_raw_widget": st.session_state.get("exclude_raw_widget", ""),
+        "location_raw_widget": st.session_state.get("location_raw_widget", ""),
+        "greenhouse_selected_widget": st.session_state.get("greenhouse_selected_widget", []),
+        "greenhouse_add_raw_widget": st.session_state.get("greenhouse_add_raw_widget", ""),
+        "quickin_selected_widget": st.session_state.get("quickin_selected_widget", []),
+        "quickin_add_raw_widget": st.session_state.get("quickin_add_raw_widget", ""),
+        "inhire_selected_widget": st.session_state.get("inhire_selected_widget", []),
+        "inhire_add_raw_widget": st.session_state.get("inhire_add_raw_widget", ""),
+    }
+
+
+def apply_form_state(state: dict[str, Any]) -> None:
+    for key, value in state.items():
+        st.session_state[key] = value
+
+
+def sync_query_params_from_form_state(state: dict[str, Any]) -> None:
+    st.query_params.clear()
+    st.query_params.update(
+        {
+            "sources": ",".join(state["sources_widget"]),
+            "include": ",".join(parse_terms(state["include_raw_widget"])),
+            "exclude": ",".join(parse_terms(state["exclude_raw_widget"])),
+            "location": ",".join(parse_terms(state["location_raw_widget"])),
+            "gh": ",".join(state["greenhouse_selected_widget"]),
+            "quickin": ",".join(state["quickin_selected_widget"]),
+            "inhire": ",".join(state["inhire_selected_widget"]),
+            "only_remote": "1" if state["only_remote_widget"] else "0",
+            "include_unknown_locations": "1" if state["include_unknown_locations_widget"] else "0",
+            "gupy_pages": str(state["gupy_pages_widget"]),
+            "inhire_timeout": str(state["inhire_timeout_widget"]),
+        }
+    )
+
+
+def save_current_search(name: str, state: dict[str, Any]) -> None:
+    cleaned_name = name.strip()
+    if not cleaned_name:
+        return
+    saved_searches = dict(st.session_state.get("saved_searches", {}))
+    saved_searches[cleaned_name] = state
+    st.session_state.saved_searches = saved_searches
+    st.session_state.saved_search_choice = cleaned_name
+    mark_storage_dirty()
+
+
+def register_search_history(name: str, config: SearchConfig) -> None:
+    history = list(st.session_state.get("search_history", []))
+    history.insert(
+        0,
+        {
+            "nome": name or "Busca sem nome",
+            "quando": pd.Timestamp.now().strftime("%d/%m %H:%M"),
+            "fontes": ", ".join(config.sources),
+            "termos": ", ".join(config.include_terms[:4]),
+            "localidade": ", ".join(config.location_terms) if config.location_terms else "Sem filtro",
+        },
+    )
+    st.session_state.search_history = history[:8]
+    mark_storage_dirty()
+
+
+def local_storage_manager() -> LocalStorage | None:
+    if not LOCAL_STORAGE_READY or LocalStorage is None:
+        return None
+    return LocalStorage()
+
+
+def mark_storage_dirty() -> None:
+    st.session_state.storage_sync_counter = int(st.session_state.get("storage_sync_counter", 0)) + 1
+
+
+def serializable_storage_payload() -> dict[str, Any]:
+    return {
+        "saved_links": sorted(st.session_state.get("saved_links", set())),
+        "hidden_links": sorted(st.session_state.get("hidden_links", set())),
+        "saved_searches": st.session_state.get("saved_searches", {}),
+        "search_history": st.session_state.get("search_history", []),
+        "cookie_notice_accepted": bool(st.session_state.get("cookie_notice_accepted", False)),
+    }
+
+
+def hydrate_storage_payload(payload: dict[str, Any]) -> None:
+    st.session_state.saved_links = set(payload.get("saved_links", []))
+    st.session_state.hidden_links = set(payload.get("hidden_links", []))
+    st.session_state.saved_searches = payload.get("saved_searches", {})
+    st.session_state.search_history = payload.get("search_history", [])
+    st.session_state.cookie_notice_accepted = bool(payload.get("cookie_notice_accepted", False))
+
+
+def sync_browser_storage() -> None:
+    local_storage = local_storage_manager()
+    if local_storage is None:
+        return
+
+    storage_key = "schenkel_startup_search_app_state"
+    cookie_key = "schenkel_cookie_notice_accepted"
+    sync_counter = int(st.session_state.get("storage_sync_counter", 0))
+
+    cookie_value = local_storage.getItem(cookie_key, key=f"load_cookie_notice_{sync_counter}")
+    if str(cookie_value).lower() in {"1", "true", "yes"}:
+        st.session_state.cookie_notice_accepted = True
+
+    if st.session_state.get("cookie_notice_accepted", False):
+        stored_value = local_storage.getItem(storage_key, key=f"load_browser_storage_{sync_counter}")
+        if stored_value and not st.session_state.get("browser_storage_loaded", False):
+            try:
+                payload = json.loads(stored_value)
+                if isinstance(payload, dict):
+                    hydrate_storage_payload(payload)
+                    st.session_state.browser_storage_loaded = True
+            except Exception:
+                pass
+    if not st.session_state.get("cookie_notice_accepted", False):
+        return
+
+    if int(st.session_state.get("storage_last_synced", -1)) == sync_counter:
+        return
+
+    local_storage.setItem(
+        storage_key,
+        json.dumps(serializable_storage_payload(), ensure_ascii=True),
+        key=f"save_browser_storage_{sync_counter}",
+    )
+    local_storage.setItem(
+        cookie_key,
+        "1",
+        key=f"save_cookie_notice_{sync_counter}",
+    )
+    st.session_state.storage_last_synced = sync_counter
+
+
+def render_cookie_notice() -> None:
+    if st.session_state.get("cookie_notice_accepted", False):
+        return
+
+    components.html(
+        """
+        <div id="schenkel-cookie-banner" style="
+            position: fixed;
+            left: 20px;
+            right: 20px;
+            bottom: 20px;
+            z-index: 9999;
+            background: rgba(24, 50, 75, 0.96);
+            color: #f7f6f1;
+            border-radius: 18px;
+            padding: 14px 18px;
+            box-shadow: 0 18px 40px rgba(0,0,0,0.22);
+            font-family: sans-serif;
+        ">
+            <div style="display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+                <div style="line-height:1.5; font-size:14px;">
+                    Este app usa cookies/local storage do navegador para salvar buscas, favoritos, vagas ocultas e preferencias no seu proprio dispositivo.
+                </div>
+                <button onclick="
+                    try {
+                        window.parent.localStorage.setItem('schenkel_cookie_notice_accepted', '1');
+                        window.parent.location.reload();
+                    } catch (error) {
+                        window.localStorage.setItem('schenkel_cookie_notice_accepted', '1');
+                        window.location.reload();
+                    }
+                " style="
+                    background:#f0d9b7;
+                    color:#173047;
+                    border:none;
+                    border-radius:999px;
+                    padding:10px 16px;
+                    font-weight:700;
+                    cursor:pointer;
+                ">Entendi</button>
+            </div>
+        </div>
+        """,
+        height=0,
+    )
 
 
 def total_steps(config: SearchConfig) -> int:
@@ -910,6 +1197,7 @@ def toggle_saved(link: str) -> None:
     else:
         saved_links.add(link)
     st.session_state.saved_links = saved_links
+    mark_storage_dirty()
 
 
 def toggle_hidden(link: str) -> None:
@@ -919,6 +1207,7 @@ def toggle_hidden(link: str) -> None:
     else:
         hidden_links.add(link)
     st.session_state.hidden_links = hidden_links
+    mark_storage_dirty()
 
 
 def show_cards(df: pd.DataFrame, runtime_id: str = "default") -> None:
@@ -1016,7 +1305,7 @@ def render_live_results_fragment(location_terms: list[str], include_unknown_loca
     with metrics_col1:
         stat("Vagas visiveis", str(len(display_df)), "Depois dos filtros e ocultacoes")
     with metrics_col2:
-        stat("Salvas", str(len(st.session_state.get("saved_links", set()))), "Marcadas na sessao atual")
+        stat("Salvas", str(len(st.session_state.get("saved_links", set()))), "Guardadas neste navegador")
     with metrics_col3:
         stat("Ocultas", str(len(st.session_state.get("hidden_links", set()))), "Escondidas da visao principal")
     with metrics_col4:
@@ -1048,52 +1337,104 @@ def render_live_results_fragment(location_terms: list[str], include_unknown_loca
 def app() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     ensure_session_state()
+    sync_browser_storage()
+    hydrate_form_state_from_query()
     apply_theme()
     hero()
 
-    greenhouse_options = cleaned_company_options(GREENHOUSE_COMPANIES + load_extra_greenhouse_companies())
-    quickin_options = cleaned_company_options(QUICKIN_COMPANIES)
-    inhire_options = cleaned_company_options(INHIRE_COMPANIES)
+    greenhouse_options = cleaned_company_options(GREENHOUSE_COMPANIES + load_extra_greenhouse_companies() + st.session_state.get("greenhouse_selected_widget", []))
+    quickin_options = cleaned_company_options(QUICKIN_COMPANIES + st.session_state.get("quickin_selected_widget", []))
+    inhire_options = cleaned_company_options(INHIRE_COMPANIES + st.session_state.get("inhire_selected_widget", []))
+
+    saved_searches = st.session_state.get("saved_searches", {})
+    saved_names = [""] + sorted(saved_searches.keys())
+
+    library_col1, library_col2, library_col3, library_col4 = st.columns([1.2, 0.9, 0.9, 1.2])
+    with library_col1:
+        st.selectbox("Buscas salvas", saved_names, key="saved_search_choice")
+    with library_col2:
+        if st.button("Carregar busca", use_container_width=True):
+            choice = st.session_state.get("saved_search_choice", "")
+            if choice and choice in saved_searches:
+                apply_form_state(saved_searches[choice])
+                sync_query_params_from_form_state(saved_searches[choice])
+                st.rerun()
+    with library_col3:
+        if st.button("Remover busca", use_container_width=True):
+            choice = st.session_state.get("saved_search_choice", "")
+            if choice and choice in saved_searches:
+                saved_searches.pop(choice, None)
+                st.session_state.saved_searches = saved_searches
+                st.session_state.saved_search_choice = ""
+                mark_storage_dirty()
+                st.rerun()
+    with library_col4:
+        st.text_input("Nome da busca", key="saved_search_name", placeholder="Ex.: Data remoto SP")
+
+    history = st.session_state.get("search_history", [])
+    if history:
+        with st.expander("Buscas recentes neste navegador", expanded=False):
+            for item in history:
+                st.caption(f"{item['quando']} | {item['nome']} | {item['fontes']} | {item['localidade']}")
+    if LOCAL_STORAGE_READY:
+        if st.session_state.get("cookie_notice_accepted", False):
+            st.caption("Favoritos, vagas ocultas, buscas salvas e historico recente ficam guardados apenas neste navegador.")
+        else:
+            st.caption("Ao aceitar o aviso no rodape, o app passa a guardar favoritos, vagas ocultas e buscas salvas apenas neste navegador.")
+    else:
+        st.caption("O modo de persistencia local nao esta disponivel neste ambiente. O app continua funcionando, mas sem salvar dados no navegador.")
+
     st.markdown('<section class="control-shell">', unsafe_allow_html=True)
     with st.form("search_form"):
         top_left, top_right = st.columns([1.1, 1.35])
         with top_left:
-            sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "Quickin", "InHire"], default=["Greenhouse", "Gupy", "Quickin", "InHire"])
-            only_remote = st.toggle("Apenas vagas remotas", value=False)
-            gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, 4)
-            inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, 12000, step=1000)
-            include_unknown_locations = st.toggle("Incluir localizacao N/A no filtro", value=False)
+            sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "Quickin", "InHire"], key="sources_widget")
+            only_remote = st.toggle("Apenas vagas remotas", key="only_remote_widget")
+            gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, key="gupy_pages_widget")
+            inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, step=1000, key="inhire_timeout_widget")
+            include_unknown_locations = st.toggle("Incluir localizacao N/A no filtro", key="include_unknown_locations_widget")
             st.caption("A Gupy agora so considera vagas publicadas em 2026 ou depois.")
             st.caption("No InHire, vagas sem info de remoto continuam aparecendo com modalidade N/A.")
         with top_right:
-            include_raw = st.text_area("Termos de inclusao", value=", ".join(INCLUDE_DEFAULTS), height=110)
-            exclude_raw = st.text_area("Termos de exclusao", value=", ".join(EXCLUDE_DEFAULTS), height=110)
-            location_raw = st.text_input("Filtro de localidade", value="", help="Ex.: sao paulo, remoto, brasilia, rio de janeiro")
+            include_raw = st.text_area("Termos de inclusao", height=110, key="include_raw_widget")
+            exclude_raw = st.text_area("Termos de exclusao", height=110, key="exclude_raw_widget")
+            location_raw = st.text_input("Filtro de localidade", key="location_raw_widget", help="Ex.: sao paulo, remoto, brasilia, rio de janeiro")
 
         boards_tab, quickin_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas Quickin", "Empresas InHire"])
         with boards_tab:
-            greenhouse_selected = st.multiselect("Selecione os boards", greenhouse_options, default=greenhouse_options)
-            greenhouse_add_raw = st.text_area("Adicionar boards manualmente", value="", height=80, help="Aceita virgula, ponto e virgula ou uma linha por slug.")
-            greenhouse_remove_raw = st.text_area("Remover boards da busca atual", value="", height=80)
+            greenhouse_selected = st.multiselect("Selecione os boards", greenhouse_options, key="greenhouse_selected_widget")
+            st.caption("Para adicionar mais empresas, use o alias/slug do board, nao apenas o nome da empresa. Pode separar por virgula, ponto e virgula ou quebra de linha.")
+            greenhouse_add_raw = st.text_area("Adicionar boards manualmente", height=80, help="Ex.: nubank, ifoodcarreiras, stone", key="greenhouse_add_raw_widget")
         with quickin_tab:
-            quickin_selected = st.multiselect("Selecione as empresas", quickin_options, default=quickin_options)
-            quickin_add_raw = st.text_area("Adicionar empresas Quickin", value="", height=80)
-            quickin_remove_raw = st.text_area("Remover empresas Quickin da busca atual", value="", height=80)
+            quickin_selected = st.multiselect("Selecione as empresas", quickin_options, key="quickin_selected_widget")
+            st.caption("Use o alias da empresa no Quickin, como aparece na URL do board. Pode separar por virgula, ponto e virgula ou quebra de linha.")
+            quickin_add_raw = st.text_area("Adicionar empresas Quickin", height=80, help="Ex.: startse, topmind, registradores", key="quickin_add_raw_widget")
         with inhire_tab:
-            inhire_selected = st.multiselect("Selecione as empresas", inhire_options, default=inhire_options)
-            inhire_add_raw = st.text_area("Adicionar empresas InHire", value="", height=80)
-            inhire_remove_raw = st.text_area("Remover empresas InHire da busca atual", value="", height=80)
+            inhire_selected = st.multiselect("Selecione as empresas", inhire_options, key="inhire_selected_widget")
+            st.caption("Use o alias da empresa no InHire, igual ao subdominio do board. Pode separar por virgula, ponto e virgula ou quebra de linha.")
+            inhire_add_raw = st.text_area("Adicionar empresas InHire", height=80, help="Ex.: olist, sympla, contabilizei", key="inhire_add_raw_widget")
 
-        left, right = st.columns([1, 2])
+        left, mid, right = st.columns([1, 1, 2])
         with left:
             clicked = st.form_submit_button("Buscar vagas agora", type="primary", use_container_width=True)
+        with mid:
+            save_search_clicked = st.form_submit_button("Salvar esta busca", use_container_width=True)
         with right:
+            share_clicked = st.form_submit_button("Atualizar link compartilhavel", use_container_width=True)
             st.caption("Os resultados entram em tela conforme cada fonte termina. No InHire, a alimentacao acontece empresa por empresa.")
     st.markdown("</section>", unsafe_allow_html=True)
 
-    greenhouse_companies = merge_company_selection(greenhouse_selected, greenhouse_add_raw, greenhouse_remove_raw)
-    quickin_companies = merge_company_selection(quickin_selected, quickin_add_raw, quickin_remove_raw)
-    inhire_companies = merge_company_selection(inhire_selected, inhire_add_raw, inhire_remove_raw)
+    form_state = current_form_state()
+    if save_search_clicked:
+        save_current_search(st.session_state.get("saved_search_name", ""), form_state)
+        st.success("Busca salva neste navegador.")
+    if share_clicked:
+        sync_query_params_from_form_state(form_state)
+        st.success("URL atualizada com os filtros atuais. Agora e so copiar o link do navegador.")
+
+    greenhouse_companies = merge_company_selection(greenhouse_selected, greenhouse_add_raw)
+    quickin_companies = merge_company_selection(quickin_selected, quickin_add_raw)
+    inhire_companies = merge_company_selection(inhire_selected, inhire_add_raw)
 
     config = SearchConfig(
         sources,
@@ -1139,10 +1480,12 @@ def app() -> None:
         if active_snapshot and active_snapshot["running"]:
             st.warning("Ja existe uma busca em andamento. Interrompa a atual antes de iniciar outra.")
         else:
+            register_search_history(st.session_state.get("saved_search_name", "").strip(), config)
             start_background_search(config)
             st.rerun()
 
     render_live_results_fragment(config.location_terms, config.include_unknown_locations)
+    render_cookie_notice()
 
 
 if __name__ == "__main__":
