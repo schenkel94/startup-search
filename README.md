@@ -5,7 +5,7 @@ Schenkel Startup Search e uma ferramenta para centralizar a busca de vagas na ar
 A ideia aqui foi unir tres fontes diferentes que ja existiam no projeto, cada uma com suas particularidades, e transformar tudo em uma interface unica em Streamlit, mais simples de usar no dia a dia.
 
 Aplicacao publicada:
-[https://startupjobsradar.streamlit.app/](https://startupjobsradar.streamlit.app/)
+[https://startup-search.onrender.com](https://startup-search.onrender.com)
 
 ## O que a ferramenta faz
 
