@@ -4,4 +4,3 @@ pandas
 beautifulsoup4
 playwright==1.58.0
 openpyxl
-streamlit-local-storage==0.0.25
