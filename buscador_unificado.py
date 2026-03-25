@@ -415,21 +415,11 @@ def extract_quickin_jobs_from_html(board_name: str, board_url: str, html: str, i
     rows: list[dict[str, Any]] = []
     seen_links: set[str] = set()
 
-    for anchor in soup.find_all("a", href=True):
-        href = urllib.parse.urljoin(board_url, anchor.get("href") or "")
-        if "/jobs/" not in href:
-            continue
-
-        title = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip()
+    def push_row(title: str, href: str, location: str, modality: str, remote: str, origin: str) -> None:
         if not title or not keep_title(title, include_terms, exclude_terms) or href in seen_links:
-            continue
-
-        container = anchor.find_parent(["li", "article", "div", "section"]) or anchor.parent
-        card_text = re.sub(r"\s+", " ", container.get_text(" ", strip=True) if container else title).strip()
-        location, modality, remote = parse_quickin_job_card(card_text, title)
+            return
         if only_remote and remote != "Sim":
-            continue
-
+            return
         rows.append(
             row(
                 "Quickin",
@@ -439,11 +429,54 @@ def extract_quickin_jobs_from_html(board_name: str, board_url: str, html: str, i
                 location,
                 modality,
                 remote,
-                "HTML Quickin",
+                origin,
                 pd.NaT,
             )
         )
         seen_links.add(href)
+
+    for tr in soup.select("table tr"):
+        link = tr.find("a", href=True)
+        if not link:
+            continue
+        href = urllib.parse.urljoin(board_url, link.get("href") or "")
+        if "/jobs/" not in href:
+            continue
+        title = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip()
+        td = tr.find("td")
+        location = "Nao informado"
+        modality, remote = "Nao informado", "Nao informado"
+        if td:
+            badge = td.find(class_=re.compile(r"\bbadge\b", re.IGNORECASE))
+            if badge:
+                modality, remote = quickin_modality_and_remote(badge.get_text(" ", strip=True))
+            loc_text = ""
+            for span in td.find_all("span"):
+                classes = " ".join(span.get("class", [])).lower()
+                if "badge" in classes:
+                    continue
+                loc_text = span.get_text(" ", strip=True)
+                if loc_text:
+                    break
+            if loc_text:
+                location = loc_text
+        push_row(title, href, location, modality, remote, "HTML Quickin")
+
+    for anchor in soup.find_all("a", href=True):
+        href = urllib.parse.urljoin(board_url, anchor.get("href") or "")
+        if "/jobs/" not in href or href in seen_links:
+            continue
+
+        title = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip()
+        if not title or not keep_title(title, include_terms, exclude_terms):
+            continue
+
+        container = anchor.find_parent(["tr", "li", "article", "div", "section"]) or anchor.parent
+        if container and container.name == "tr":
+            continue
+        card_text = re.sub(r"\s+", " ", container.get_text(" ", strip=True) if container else title).strip()
+        location, modality, remote = parse_quickin_job_card(card_text, title)
+        push_row(title, href, location, modality, remote, "HTML Quickin")
 
     return rows
 
@@ -801,20 +834,53 @@ def render_progress_results(df: pd.DataFrame, stage_label: str, final: bool = Fa
         return
 
     label = "Resultados finais" if final else f"Fluxo ao vivo apos {stage_label}"
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        stat("Vagas", str(len(df)), "Carregadas ate agora")
-    with col2:
-        stat("Empresas", str(df["Empresa"].nunique()), "Com resultado parcial")
-    with col3:
-        st.markdown(f"### {label}")
-        st.caption("A lista vai sendo enriquecida conforme cada fonte termina ou o InHire fecha uma empresa.")
-    st.dataframe(
-        df[["Fonte", "Empresa", "Vaga", "Data", "Remoto?", "Origem da coleta", "Link"]],
-        hide_index=True,
-        use_container_width=True,
-        column_config={"Link": st.column_config.LinkColumn("Link", display_text="Abrir vaga")},
-    )
+    total = len(df)
+    companies = df["Empresa"].nunique()
+    sources = df["Fonte"].nunique()
+    remote_count = int((df["Remoto?"] == "Sim").sum())
+    remote_pct = int(round((remote_count / total) * 100)) if total else 0
+
+    st.markdown(f"### {label}")
+    st.caption("A lista vai sendo enriquecida conforme cada fonte termina ou o InHire fecha uma empresa.")
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    with metric_col1:
+        stat("Vagas", str(total), "Carregadas ate agora")
+    with metric_col2:
+        stat("Empresas", str(companies), "Com resultado no recorte")
+    with metric_col3:
+        stat("Fontes", str(sources), "Ativas nesta busca")
+    with metric_col4:
+        stat("Remotas", f"{remote_pct}%", f"{remote_count} vagas marcadas")
+
+    source_counts = df["Fonte"].value_counts()
+    palette = ["#f06a37", "#1f8a70", "#3d6fb6", "#c06b9d", "#2f9aa0", "#8b6f4e"]
+    segments = []
+    legend_items = []
+    total_source = int(source_counts.sum())
+    cumulative = 0.0
+    for idx, (name, count) in enumerate(source_counts.items()):
+        if count <= 0:
+            continue
+        pct = (count / total_source) * 100 if total_source else 0
+        color = palette[idx % len(palette)]
+        start = cumulative
+        cumulative += pct
+        segments.append(f"{color} {start:.2f}% {cumulative:.2f}%")
+        legend_items.append(f"<div class='legend-item'><span class='legend-swatch' style='background:{color};'></span>{name} <strong>{count}</strong></div>")
+
+    donut_gradient = ", ".join(segments) if segments else "#eef1f4 0 100%"
+    donut_html = f"""
+        <div class="donut-wrap">
+            <div class="donut" style="background: conic-gradient({donut_gradient});"></div>
+            <div>
+                <div class="section-title" style="margin-bottom:.2rem;">Distribuicao por fonte</div>
+                <div class="section-subtitle" style="margin-bottom:.6rem;">Percentual do feed atual por origem</div>
+                <div class="donut-legend">{''.join(legend_items)}</div>
+            </div>
+        </div>
+    """
+    st.markdown(donut_html, unsafe_allow_html=True)
 
 
 def start_background_search(config: SearchConfig) -> None:
@@ -940,6 +1006,26 @@ def apply_theme() -> None:
         .control-shell { padding: 1.35rem 1.45rem; margin-bottom: 1rem; }
         .section-title { color: var(--ink); font-weight: 700; font-size: 1.05rem; margin-bottom: .35rem; }
         .section-subtitle { color: var(--muted); font-size: .95rem; margin-bottom: .85rem; }
+        .donut-wrap { display: flex; gap: 1.2rem; align-items: center; margin-top: 1rem; }
+        .donut {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            position: relative;
+            box-shadow: inset 0 0 0 10px rgba(255,255,255,0.9);
+        }
+        .donut::after {
+            content: "";
+            position: absolute;
+            inset: 18px;
+            background: var(--panel);
+            border-radius: 50%;
+            border: 1px solid var(--stroke);
+        }
+        .donut-legend { display: grid; gap: .35rem; }
+        .legend-item { display:flex; align-items:center; gap:.5rem; font-size:.9rem; color: var(--muted); }
+        .legend-item strong { color: var(--ink); font-weight: 700; margin-left: .25rem; }
+        .legend-swatch { width: 12px; height: 12px; border-radius: 4px; display: inline-block; }
         .card { padding: 1rem 1.1rem; min-height: 110px; }
         .label { color: #7d8894; text-transform: uppercase; letter-spacing: .12em; font-size: .72rem; }
         .value { color: var(--ink); font-size: 1.65rem; font-weight: 700; }
@@ -1069,16 +1155,6 @@ def render_live_results_fragment(location_terms: list[str], include_unknown_loca
         return
 
     render_progress_results(display_df, snapshot["status"], final=not snapshot["running"])
-
-    metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
-    with metrics_col1:
-        stat("Vagas visiveis", str(len(display_df)), "Depois dos filtros aplicados")
-    with metrics_col2:
-        stat("Empresas", str(display_df["Empresa"].nunique()), "Com vagas no recorte atual")
-    with metrics_col3:
-        stat("Remotas", str(int((display_df["Remoto?"] == "Sim").sum())), "Quando a fonte informa")
-    with metrics_col4:
-        stat("Fontes", str(display_df["Fonte"].nunique()), "Ativas nesta busca")
 
     csv_bytes = display_df[["Fonte", "Origem da coleta", "Empresa", "Vaga", "Localizacao", "Modalidade", "Remoto?", "Data", "Link"]].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     excel_buffer = BytesIO()
