@@ -25,7 +25,7 @@ except Exception:
     PLAYWRIGHT_READY = False
 
 
-APP_TITLE = "🕵️Schenkel Startup Search"
+APP_TITLE = "🕵️ Schenkel Startup Search"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
@@ -45,23 +45,13 @@ GREENHOUSE_COMPANIES = sorted(
     )
 )
 INHIRE_COMPANIES = """
-olist openlabs orizon paytrack premiersoft radix shareprime sylvamo sympla talentx tripla
-unimar v360 v4company vitru warren zig contabilizei kiwify bancotoyota adelcoco solutis
-programmers gruposabe dbservices grupojra proselect elsys frete sidia gpcorpbr talentetech
-contaazul oliveiraeantunes svninvestimentos
+solfacil idwall unico cobli piposaude reclameaqui agenciacriativa agrosearch alice amcom ceisc cielo cora crown deloitte flutterbrazil fretadao infotecbrasil magalu milvus nomadglobal olist openlabs orizon paytrack premiersoft radix shareprime sylvamo sympla talentx tripla unimar v360 v4company vitru warren zig contabilizei kiwify bancotoyota adelcoco solutis programmers gruposabe dbservices grupojra proselect elsys frete sidia gpcorpbr talentetech contaazul oliveiraeantunes svninvestimentos
 """.split()
-QUICKIN_COMPANIES = [
-    "startse",
-    "topmind",
-    "registradores",
-    "devos",
-    "networksecure",
-    "solupeople",
-    "vagas",
-    "infovagas",
-    "qintess",
-    "sinqia"
-]
+
+QUICKIN_COMPANIES = """
+assefaz ats base2 beltis biomedspharma cadmus coders creditsbrasil devos dibconsultoria dmpessoas dommainc evtit gamestation gbase globalconsultoria greentalents groove gruponunchi hardware henriquebaiao idgengenharia infovagas integraltrust jetbov kalendae leansales m2consult opencircle pessoalizerh peoplemeet prestorh proesc quilleconsultoria rbrasset refrisat registradores reply reviewall rhshopping rmaish sapiens seekerh sinqia sklep smarthospital solupeople startse tagna talentorh tecnocomp texian topmind umanerhecarreira uniao unimedinconfidentes vagas vagasconsultoria weemais workestagios workingcenter zbrasolutions startse topmind registradores devos networksecure solupeople vagas infovagas qintess sinqia
+""".split()
+
 INCLUDE_DEFAULTS = [
     "analista de dados",
     "data analyst",
