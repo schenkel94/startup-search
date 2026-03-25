@@ -4,9 +4,10 @@ import json
 import re
 import unicodedata
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any
 
 import pandas as pd
@@ -87,12 +88,31 @@ class SearchConfig:
     sources: list[str]
     include_terms: list[str]
     exclude_terms: list[str]
+    location_terms: list[str]
+    include_unknown_locations: bool
     only_remote: bool
     greenhouse_companies: list[str]
     inhire_companies: list[str]
     quickin_companies: list[str]
     gupy_pages: int
     inhire_timeout_ms: int
+
+
+@dataclass
+class SearchRuntime:
+    search_id: str
+    total_steps: int
+    running: bool = True
+    finished: bool = False
+    stopped: bool = False
+    completed_steps: int = 0
+    status: str = "Preparando busca..."
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: str = ""
+    thread: Thread | None = None
+    stop_event: Event = field(default_factory=Event)
+    lock: Lock = field(default_factory=Lock)
 
 
 def norm(text: str) -> str:
@@ -103,6 +123,17 @@ def norm(text: str) -> str:
 def parse_terms(raw: str) -> list[str]:
     items = [norm(x) for x in re.split(r"[\n,;]+", raw or "")]
     return list(dict.fromkeys([x for x in items if x]))
+
+
+def merge_company_selection(selected: list[str], additions_raw: str, removals_raw: str) -> list[str]:
+    additions = parse_terms(additions_raw)
+    removals = set(parse_terms(removals_raw))
+    merged = list(dict.fromkeys([*selected, *additions]))
+    return [item for item in merged if item not in removals]
+
+
+def cleaned_company_options(items: list[str]) -> list[str]:
+    return sorted(set(item.strip().lower() for item in items if item and item.strip()))
 
 
 def has_term(text: str, terms: list[str]) -> bool:
@@ -139,13 +170,15 @@ def load_extra_greenhouse_companies() -> list[str]:
 
 
 def row(source: str, company: str, title: str, link: str, location: str, modal: str, remote: str, origin: str, date: pd.Timestamp) -> dict[str, Any]:
+    normalized_location = "N/A" if not location or norm(location) in {"nao informado", "n/a"} else location
+    normalized_modal = "N/A" if not modal or norm(modal) in {"nao informado", "n/a"} else modal
     return {
         "Fonte": source,
         "Origem da coleta": origin,
         "Empresa": company,
         "Vaga": title,
-        "Localizacao": location,
-        "Modalidade": modal,
+        "Localizacao": normalized_location,
+        "Modalidade": normalized_modal,
         "Remoto?": remote,
         "Data": fmt_date(date),
         "Link": link,
@@ -165,6 +198,107 @@ def build_results_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
             na_position="last",
         ).reset_index(drop=True)
     return df
+
+
+def apply_display_filters(df: pd.DataFrame, location_terms: list[str], include_unknown_locations: bool) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    filtered = df.copy()
+    hidden_links = st.session_state.get("hidden_links", set())
+    saved_links = st.session_state.get("saved_links", set())
+    show_only_saved = bool(st.session_state.get("show_only_saved", False))
+    show_hidden = bool(st.session_state.get("show_hidden_jobs", False))
+
+    if not show_hidden and hidden_links:
+        filtered = filtered[~filtered["Link"].isin(hidden_links)]
+    if show_only_saved:
+        filtered = filtered[filtered["Link"].isin(saved_links)]
+
+    if location_terms:
+        normalized_locations = filtered["Localizacao"].fillna("N/A").map(norm)
+        mask = normalized_locations.apply(lambda value: any(term in value for term in location_terms))
+        if include_unknown_locations:
+            mask = mask | filtered["Localizacao"].fillna("N/A").isin(["N/A", "Nao informado"])
+        filtered = filtered[mask]
+
+    return filtered.reset_index(drop=True)
+
+
+def share_urls(item: dict[str, Any]) -> dict[str, str]:
+    share_text = f"{item['Vaga']} | {item['Empresa']} | {item['Fonte']} | {item['Link']}"
+    encoded_text = urllib.parse.quote(share_text)
+    encoded_link = urllib.parse.quote(item["Link"])
+    return {
+        "WhatsApp": f"https://wa.me/?text={encoded_text}",
+        "Telegram": f"https://t.me/share/url?url={encoded_link}&text={urllib.parse.quote(item['Vaga'])}",
+        "LinkedIn": f"https://www.linkedin.com/sharing/share-offsite/?url={encoded_link}",
+    }
+
+
+def ensure_session_state() -> None:
+    st.session_state.setdefault("saved_links", set())
+    st.session_state.setdefault("hidden_links", set())
+    st.session_state.setdefault("show_only_saved", False)
+    st.session_state.setdefault("show_hidden_jobs", False)
+    st.session_state.setdefault("active_runtime", None)
+
+
+def total_steps(config: SearchConfig) -> int:
+    return max(
+        (len(config.greenhouse_companies) if "Greenhouse" in config.sources else 0)
+        + (max(1, len(config.include_terms)) if "Gupy" in config.sources else 0)
+        + (len(config.quickin_companies) if "Quickin" in config.sources else 0)
+        + (len(config.inhire_companies) if "InHire" in config.sources else 0),
+        1,
+    )
+
+
+def runtime_snapshot(runtime: SearchRuntime | None) -> dict[str, Any] | None:
+    if runtime is None:
+        return None
+    with runtime.lock:
+        return {
+            "search_id": runtime.search_id,
+            "running": runtime.running,
+            "finished": runtime.finished,
+            "stopped": runtime.stopped,
+            "completed_steps": runtime.completed_steps,
+            "total_steps": runtime.total_steps,
+            "status": runtime.status,
+            "rows": list(runtime.rows),
+            "warnings": list(runtime.warnings),
+            "error": runtime.error,
+        }
+
+
+def set_runtime_status(runtime: SearchRuntime, message: str, tick: bool = False) -> None:
+    with runtime.lock:
+        runtime.status = message
+        if tick:
+            runtime.completed_steps += 1
+
+
+def extend_runtime_results(runtime: SearchRuntime, rows: list[dict[str, Any]]) -> None:
+    with runtime.lock:
+        runtime.rows = build_results_df(rows).to_dict("records")
+
+
+def extend_runtime_warnings(runtime: SearchRuntime, warnings: list[str]) -> None:
+    if not warnings:
+        return
+    with runtime.lock:
+        runtime.warnings.extend(warnings)
+
+
+def mark_runtime_finished(runtime: SearchRuntime, rows: list[dict[str, Any]], stopped: bool = False, error: str = "") -> None:
+    with runtime.lock:
+        runtime.rows = build_results_df(rows).to_dict("records")
+        runtime.running = False
+        runtime.finished = True
+        runtime.stopped = stopped
+        runtime.error = error
+        runtime.status = "Busca interrompida" if stopped else "Busca concluida"
 
 
 def requests_headers() -> dict[str, str]:
@@ -278,11 +412,13 @@ def extract_quickin_jobs_from_html(board_name: str, board_url: str, html: str, i
     return rows
 
 
-def search_quickin(config: SearchConfig, tick, on_partial=None) -> tuple[list[dict[str, Any]], list[str]]:
+def search_quickin(config: SearchConfig, tick, on_partial=None, should_stop=None) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
 
     for company in config.quickin_companies:
+        if should_stop and should_stop():
+            break
         tick(f"Quickin: {company}")
         try:
             board_url, html = fetch_quickin_board(company)
@@ -298,6 +434,8 @@ def search_quickin(config: SearchConfig, tick, on_partial=None) -> tuple[list[di
             )
 
             for page_url in page_urls[1:]:
+                if should_stop and should_stop():
+                    break
                 try:
                     response = requests.get(page_url, headers=requests_headers(), timeout=25)
                     response.raise_for_status()
@@ -325,10 +463,12 @@ def search_quickin(config: SearchConfig, tick, on_partial=None) -> tuple[list[di
     return build_results_df(rows).to_dict("records"), warnings
 
 
-def search_greenhouse(config: SearchConfig, tick) -> tuple[list[dict[str, Any]], list[str]]:
+def search_greenhouse(config: SearchConfig, tick, should_stop=None) -> tuple[list[dict[str, Any]], list[str]]:
     out, warnings = [], []
     remote_terms = [norm(x) for x in REMOTE_TERMS]
     for company in config.greenhouse_companies:
+        if should_stop and should_stop():
+            break
         tick(f"Greenhouse: {company}")
         try:
             jobs = fetch_greenhouse(company)
@@ -390,9 +530,11 @@ def gupy_modal(job: dict[str, Any]) -> tuple[str, str]:
     return "Indefinido", "Nao informado"
 
 
-def search_gupy(config: SearchConfig, tick) -> tuple[list[dict[str, Any]], list[str]]:
+def search_gupy(config: SearchConfig, tick, should_stop=None) -> tuple[list[dict[str, Any]], list[str]]:
     out, warnings, seen = [], [], set()
     for term in config.include_terms or ["analista de dados"]:
+        if should_stop and should_stop():
+            break
         tick(f"Gupy: {term}")
         try:
             jobs = fetch_gupy(term, config.gupy_pages)
@@ -400,6 +542,8 @@ def search_gupy(config: SearchConfig, tick) -> tuple[list[dict[str, Any]], list[
             warnings.append(f"Gupy falhou para '{term}': {exc}")
             continue
         for job in jobs:
+            if should_stop and should_stop():
+                break
             title = (job.get("name") or "").strip()
             link = (job.get("jobUrl") or f"https://portal.gupy.io/jobs/{job.get('id')}").strip()
             if not title or not link or link in seen or not keep_title(title, config.include_terms, config.exclude_terms):
@@ -411,7 +555,7 @@ def search_gupy(config: SearchConfig, tick) -> tuple[list[dict[str, Any]], list[
             if config.only_remote and remote != "Sim":
                 continue
             seen.add(link)
-            location = ", ".join([part.strip() for part in [job.get("city"), job.get("state")] if isinstance(part, str) and part.strip()]) or "Nao informado"
+            location = ", ".join([part.strip() for part in [job.get("city"), job.get("state")] if isinstance(part, str) and part.strip()]) or "N/A"
             out.append(row("Gupy", str(job.get("careerPageName") or "Gupy").upper(), title, link, location, modal, remote, "API Gupy", published_date))
     return out, warnings
 
@@ -492,7 +636,7 @@ def inhire_candidates(page, html: str, listing_url: str, include_terms: list[str
     return deduped
 
 
-def search_inhire(config: SearchConfig, tick, on_partial=None) -> tuple[list[dict[str, Any]], list[str]]:
+def search_inhire(config: SearchConfig, tick, on_partial=None, should_stop=None) -> tuple[list[dict[str, Any]], list[str]]:
     if not config.inhire_companies:
         return [], []
     if not PLAYWRIGHT_READY or sync_playwright is None:
@@ -533,6 +677,8 @@ def search_inhire(config: SearchConfig, tick, on_partial=None) -> tuple[list[dic
 
             try:
                 for company in config.inhire_companies:
+                    if should_stop and should_stop():
+                        break
                     tick(f"InHire: {company}")
                     page = context.new_page()
                     payloads: list[Any] = []
@@ -575,6 +721,8 @@ def search_inhire(config: SearchConfig, tick, on_partial=None) -> tuple[list[dic
                         html = page.content()
                         company_rows: list[dict[str, Any]] = []
                         for item in inhire_candidates(page, html, listing_url, config.include_terms, payloads):
+                            if should_stop and should_stop():
+                                break
                             if has_term(item["title"], config.exclude_terms):
                                 continue
                             company_rows.append(
@@ -633,46 +781,76 @@ def render_progress_results(df: pd.DataFrame, stage_label: str, final: bool = Fa
     )
 
 
-def run_search(config: SearchConfig, live_render=None) -> tuple[pd.DataFrame, list[str]]:
-    steps = max(
-        (len(config.greenhouse_companies) if "Greenhouse" in config.sources else 0)
-        + (max(1, len(config.include_terms)) if "Gupy" in config.sources else 0)
-        + (len(config.quickin_companies) if "Quickin" in config.sources else 0)
-        + (len(config.inhire_companies) if "InHire" in config.sources else 0),
-        1,
+def start_background_search(config: SearchConfig) -> None:
+    runtime = SearchRuntime(
+        search_id=str(pd.Timestamp.utcnow().value),
+        total_steps=total_steps(config),
     )
-    progress, label, count = st.progress(0.0), st.empty(), 0
-    def tick(message: str) -> None:
-        nonlocal count
-        count += 1
-        label.info(f"Buscando em {message}...")
-        progress.progress(min(count / steps, 1.0))
-    rows, warnings = [], []
-    if "Greenhouse" in config.sources:
-        r, w = search_greenhouse(config, tick); rows += r; warnings += w
-        if live_render and rows:
-            live_render(build_results_df(rows), "Greenhouse")
-    if "Gupy" in config.sources:
-        r, w = search_gupy(config, tick); rows += r; warnings += w
-        if live_render and rows:
-            live_render(build_results_df(rows), "Gupy")
-    if "Quickin" in config.sources:
-        def render_quickin_partial(quickin_partial_rows: list[dict[str, Any]], stage_label: str) -> None:
-            if live_render:
-                live_render(build_results_df(rows + quickin_partial_rows), f"Quickin {stage_label}")
-        r, w = search_quickin(config, tick, on_partial=render_quickin_partial); rows += r; warnings += w
-        if live_render and rows:
-            live_render(build_results_df(rows), "Quickin")
-    if "InHire" in config.sources:
-        def render_partial(inhire_partial_rows: list[dict[str, Any]], stage_label: str) -> None:
-            if live_render:
-                live_render(build_results_df(rows + inhire_partial_rows), f"InHire {stage_label}")
-        r, w = search_inhire(config, tick, on_partial=render_partial); rows += r; warnings += w
-        if live_render and rows:
-            live_render(build_results_df(rows), "InHire")
-    label.empty(); progress.empty()
-    df = build_results_df(rows)
-    return df, warnings
+
+    def worker() -> None:
+        rows: list[dict[str, Any]] = []
+
+        def should_stop() -> bool:
+            return runtime.stop_event.is_set()
+
+        def tick(message: str) -> None:
+            set_runtime_status(runtime, f"Buscando em {message}...", tick=True)
+
+        try:
+            if "Greenhouse" in config.sources and not should_stop():
+                result_rows, result_warnings = search_greenhouse(config, tick, should_stop=should_stop)
+                rows += result_rows
+                extend_runtime_results(runtime, rows)
+                extend_runtime_warnings(runtime, result_warnings)
+
+            if "Gupy" in config.sources and not should_stop():
+                result_rows, result_warnings = search_gupy(config, tick, should_stop=should_stop)
+                rows += result_rows
+                extend_runtime_results(runtime, rows)
+                extend_runtime_warnings(runtime, result_warnings)
+
+            if "Quickin" in config.sources and not should_stop():
+                def quickin_partial(partial_rows: list[dict[str, Any]], stage_label: str) -> None:
+                    set_runtime_status(runtime, f"Quickin atualizou {stage_label}.")
+                    extend_runtime_results(runtime, rows + partial_rows)
+
+                result_rows, result_warnings = search_quickin(
+                    config,
+                    tick,
+                    on_partial=quickin_partial,
+                    should_stop=should_stop,
+                )
+                rows += result_rows
+                extend_runtime_results(runtime, rows)
+                extend_runtime_warnings(runtime, result_warnings)
+
+            if "InHire" in config.sources and not should_stop():
+                def inhire_partial(partial_rows: list[dict[str, Any]], stage_label: str) -> None:
+                    set_runtime_status(runtime, f"InHire atualizou {stage_label}.")
+                    extend_runtime_results(runtime, rows + partial_rows)
+
+                result_rows, result_warnings = search_inhire(
+                    config,
+                    tick,
+                    on_partial=inhire_partial,
+                    should_stop=should_stop,
+                )
+                rows += result_rows
+                extend_runtime_results(runtime, rows)
+                extend_runtime_warnings(runtime, result_warnings)
+
+            if should_stop():
+                extend_runtime_warnings(runtime, ["Busca interrompida pelo usuario."])
+                mark_runtime_finished(runtime, rows, stopped=True)
+            else:
+                mark_runtime_finished(runtime, rows)
+        except Exception as exc:
+            extend_runtime_warnings(runtime, [f"Erro inesperado na busca: {exc}"])
+            mark_runtime_finished(runtime, rows, error=str(exc))
+
+    runtime.thread = Thread(target=worker, daemon=True)
+    st.session_state.active_runtime = runtime
+    runtime.thread.start()
 
 
 def apply_theme() -> None:
@@ -725,15 +903,38 @@ def stat(label: str, value: str, note: str) -> None:
     st.markdown(f'<div class="card"><div class="label">{label}</div><div class="value">{value}</div><div class="note">{note}</div></div>', unsafe_allow_html=True)
 
 
-def show_cards(df: pd.DataFrame) -> None:
-    for item in df.to_dict("records"):
+def toggle_saved(link: str) -> None:
+    saved_links = set(st.session_state.get("saved_links", set()))
+    if link in saved_links:
+        saved_links.remove(link)
+    else:
+        saved_links.add(link)
+    st.session_state.saved_links = saved_links
+
+
+def toggle_hidden(link: str) -> None:
+    hidden_links = set(st.session_state.get("hidden_links", set()))
+    if link in hidden_links:
+        hidden_links.remove(link)
+    else:
+        hidden_links.add(link)
+    st.session_state.hidden_links = hidden_links
+
+
+def show_cards(df: pd.DataFrame, runtime_id: str = "default") -> None:
+    saved_links = st.session_state.get("saved_links", set())
+    hidden_links = st.session_state.get("hidden_links", set())
+
+    for index, item in enumerate(df.to_dict("records")):
         badge = "yes" if item["Remoto?"] == "Sim" else "no" if item["Remoto?"] == "Nao" else "na"
+        saved_badge = '<span class="pill source">Salva</span>' if item["Link"] in saved_links else ""
         st.markdown(
             f"""
             <section class="job">
                 <span class="pill source">{item['Fonte']}</span>
                 <span class="pill {badge}">Remoto? {item['Remoto?']}</span>
                 <span class="pill na">{item['Origem da coleta']}</span>
+                {saved_badge}
                 <div class="title">{item['Vaga']}</div>
                 <div class="company">{item['Empresa']}</div>
                 <div class="meta">
@@ -745,15 +946,114 @@ def show_cards(df: pd.DataFrame) -> None:
             """,
             unsafe_allow_html=True,
         )
-        st.link_button("Abrir vaga", item["Link"], use_container_width=True)
+        action_open, action_save, action_hide, action_share = st.columns([1.15, 0.8, 0.8, 1.1])
+        with action_open:
+            st.link_button("Abrir vaga", item["Link"], use_container_width=True)
+        with action_save:
+            if st.button("Salvar" if item["Link"] not in saved_links else "Remover", key=f"save_{runtime_id}_{index}", use_container_width=True):
+                toggle_saved(item["Link"])
+                st.rerun()
+        with action_hide:
+            if st.button("Ocultar" if item["Link"] not in hidden_links else "Reexibir", key=f"hide_{runtime_id}_{index}", use_container_width=True):
+                toggle_hidden(item["Link"])
+                st.rerun()
+        with action_share:
+            with st.popover("Compartilhar", use_container_width=True):
+                urls = share_urls(item)
+                st.markdown(f"[WhatsApp]({urls['WhatsApp']})")
+                st.markdown(f"[Telegram]({urls['Telegram']})")
+                st.markdown(f"[LinkedIn]({urls['LinkedIn']})")
+
+
+@st.fragment(run_every="2s")
+def render_live_results_fragment(location_terms: list[str], include_unknown_locations: bool) -> None:
+    runtime = st.session_state.get("active_runtime")
+    snapshot = runtime_snapshot(runtime)
+
+    if snapshot is None:
+        st.info("Rode uma busca para abrir o workspace de resultados.")
+        return
+
+    raw_df = build_results_df(snapshot["rows"])
+    display_df = apply_display_filters(raw_df, location_terms, include_unknown_locations)
+
+    progress_value = 0.0
+    if snapshot["total_steps"]:
+        progress_value = min(snapshot["completed_steps"] / snapshot["total_steps"], 1.0)
+
+    head1, head2, head3 = st.columns([1.4, 1, 1])
+    with head1:
+        st.markdown(f"### {snapshot['status']}")
+        st.caption(
+            "Busca em andamento" if snapshot["running"] else
+            ("Busca interrompida" if snapshot["stopped"] else "Busca finalizada")
+        )
+    with head2:
+        st.progress(progress_value, text=f"{snapshot['completed_steps']} de {snapshot['total_steps']} etapas")
+    with head3:
+        if snapshot["running"]:
+            if st.button("Interromper busca", key=f"stop_{snapshot['search_id']}", type="secondary", use_container_width=True):
+                runtime.stop_event.set()
+                set_runtime_status(runtime, "Interrompendo busca...")
+                st.rerun()
+        else:
+            st.caption("Voce pode ajustar filtros de exibicao sem rodar tudo de novo.")
+
+    if snapshot["warnings"]:
+        for warning in snapshot["warnings"][-5:]:
+            st.warning(warning)
+
+    if display_df.empty:
+        if raw_df.empty:
+            st.info("Nenhuma vaga carregada ainda.")
+        else:
+            st.info("Nao ha vagas visiveis com os filtros atuais de exibicao.")
+        return
+
+    render_progress_results(display_df, snapshot["status"], final=not snapshot["running"])
+
+    metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+    with metrics_col1:
+        stat("Vagas visiveis", str(len(display_df)), "Depois dos filtros e ocultacoes")
+    with metrics_col2:
+        stat("Salvas", str(len(st.session_state.get("saved_links", set()))), "Marcadas na sessao atual")
+    with metrics_col3:
+        stat("Ocultas", str(len(st.session_state.get("hidden_links", set()))), "Escondidas da visao principal")
+    with metrics_col4:
+        stat("Empresas", str(display_df["Empresa"].nunique()), "Com vagas no recorte atual")
+
+    csv_bytes = display_df[["Fonte", "Origem da coleta", "Empresa", "Vaga", "Localizacao", "Modalidade", "Remoto?", "Data", "Link"]].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        display_df[["Fonte", "Origem da coleta", "Empresa", "Vaga", "Localizacao", "Modalidade", "Remoto?", "Data", "Link"]].to_excel(writer, index=False)
+
+    download_col1, download_col2 = st.columns(2)
+    with download_col1:
+        st.download_button("Baixar CSV", csv_bytes, "vagas_dados_unificadas.csv", "text/csv", use_container_width=True)
+    with download_col2:
+        st.download_button("Baixar Excel", excel_buffer.getvalue(), "vagas_dados_unificadas.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+    feed_tab, table_tab = st.tabs(["Feed", "Tabela completa"])
+    with feed_tab:
+        show_cards(display_df, runtime_id=snapshot["search_id"])
+    with table_tab:
+        st.dataframe(
+            display_df[["Fonte", "Origem da coleta", "Empresa", "Vaga", "Localizacao", "Modalidade", "Remoto?", "Data", "Link"]],
+            hide_index=True,
+            use_container_width=True,
+            column_config={"Link": st.column_config.LinkColumn("Link", display_text="Abrir vaga")},
+        )
 
 
 def app() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
+    ensure_session_state()
     apply_theme()
     hero()
 
-    greenhouse_options = sorted(set(GREENHOUSE_COMPANIES + load_extra_greenhouse_companies()))
+    greenhouse_options = cleaned_company_options(GREENHOUSE_COMPANIES + load_extra_greenhouse_companies())
+    quickin_options = cleaned_company_options(QUICKIN_COMPANIES)
+    inhire_options = cleaned_company_options(INHIRE_COMPANIES)
     st.markdown('<section class="control-shell">', unsafe_allow_html=True)
     with st.form("search_form"):
         top_left, top_right = st.columns([1.1, 1.35])
@@ -762,19 +1062,27 @@ def app() -> None:
             only_remote = st.toggle("Apenas vagas remotas", value=False)
             gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, 4)
             inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, 12000, step=1000)
+            include_unknown_locations = st.toggle("Incluir localizacao N/A no filtro", value=False)
             st.caption("A Gupy agora so considera vagas publicadas em 2026 ou depois.")
             st.caption("No InHire, vagas sem info de remoto continuam aparecendo com modalidade N/A.")
         with top_right:
             include_raw = st.text_area("Termos de inclusao", value=", ".join(INCLUDE_DEFAULTS), height=110)
             exclude_raw = st.text_area("Termos de exclusao", value=", ".join(EXCLUDE_DEFAULTS), height=110)
+            location_raw = st.text_input("Filtro de localidade", value="", help="Ex.: sao paulo, remoto, brasilia, rio de janeiro")
 
         boards_tab, quickin_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas Quickin", "Empresas InHire"])
         with boards_tab:
-            greenhouse_companies = st.multiselect("Selecione os boards", greenhouse_options, default=greenhouse_options)
+            greenhouse_selected = st.multiselect("Selecione os boards", greenhouse_options, default=greenhouse_options)
+            greenhouse_add_raw = st.text_area("Adicionar boards manualmente", value="", height=80, help="Aceita virgula, ponto e virgula ou uma linha por slug.")
+            greenhouse_remove_raw = st.text_area("Remover boards da busca atual", value="", height=80)
         with quickin_tab:
-            quickin_companies = st.multiselect("Selecione as empresas", QUICKIN_COMPANIES, default=QUICKIN_COMPANIES)
+            quickin_selected = st.multiselect("Selecione as empresas", quickin_options, default=quickin_options)
+            quickin_add_raw = st.text_area("Adicionar empresas Quickin", value="", height=80)
+            quickin_remove_raw = st.text_area("Remover empresas Quickin da busca atual", value="", height=80)
         with inhire_tab:
-            inhire_companies = st.multiselect("Selecione as empresas", INHIRE_COMPANIES, default=INHIRE_COMPANIES)
+            inhire_selected = st.multiselect("Selecione as empresas", inhire_options, default=inhire_options)
+            inhire_add_raw = st.text_area("Adicionar empresas InHire", value="", height=80)
+            inhire_remove_raw = st.text_area("Remover empresas InHire da busca atual", value="", height=80)
 
         left, right = st.columns([1, 2])
         with left:
@@ -783,10 +1091,16 @@ def app() -> None:
             st.caption("Os resultados entram em tela conforme cada fonte termina. No InHire, a alimentacao acontece empresa por empresa.")
     st.markdown("</section>", unsafe_allow_html=True)
 
+    greenhouse_companies = merge_company_selection(greenhouse_selected, greenhouse_add_raw, greenhouse_remove_raw)
+    quickin_companies = merge_company_selection(quickin_selected, quickin_add_raw, quickin_remove_raw)
+    inhire_companies = merge_company_selection(inhire_selected, inhire_add_raw, inhire_remove_raw)
+
     config = SearchConfig(
         sources,
         parse_terms(include_raw),
         parse_terms(exclude_raw),
+        parse_terms(location_raw),
+        include_unknown_locations,
         only_remote,
         greenhouse_companies,
         inhire_companies,
@@ -806,67 +1120,29 @@ def app() -> None:
     if "InHire" in config.sources and not config.inhire_companies:
         problems.append("Selecione ao menos uma empresa do InHire.")
 
+    display_col1, display_col2, display_col3 = st.columns([1.2, 1, 1.4])
+    with display_col1:
+        st.toggle("Mostrar apenas vagas salvas", key="show_only_saved")
+    with display_col2:
+        st.toggle("Mostrar vagas ocultas", key="show_hidden_jobs")
+    with display_col3:
+        st.caption("Use salvar, ocultar e compartilhar direto no feed para transformar a busca em rotina de acompanhamento.")
+
     if problems:
         for problem in problems:
             st.error(problem)
         return
-    if not clicked:
-        st.info("Escolha as fontes, refine os termos e rode a busca. A lista vai sendo atualizada na tela sem precisar esperar tudo terminar.")
-        return
+    active_runtime = st.session_state.get("active_runtime")
+    active_snapshot = runtime_snapshot(active_runtime)
 
-    results_placeholder = st.empty()
+    if clicked:
+        if active_snapshot and active_snapshot["running"]:
+            st.warning("Ja existe uma busca em andamento. Interrompa a atual antes de iniciar outra.")
+        else:
+            start_background_search(config)
+            st.rerun()
 
-    def live_render(df_partial: pd.DataFrame, stage_label: str) -> None:
-        with results_placeholder.container():
-            render_progress_results(df_partial, stage_label, final=False)
-
-    with st.spinner("Escaneando fontes de vagas..."):
-        df, warnings = run_search(config, live_render=live_render)
-    for warning in warnings:
-        st.warning(warning)
-    with results_placeholder.container():
-        if df.empty:
-            st.info("Nenhuma vaga encontrada com os filtros atuais.")
-            return
-
-        flat_df = df[["Fonte", "Origem da coleta", "Empresa", "Vaga", "Localizacao", "Modalidade", "Remoto?", "Data", "Link"]].copy()
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            stat("Vagas", str(len(flat_df)), "Resultados consolidados")
-        with c2:
-            stat("Empresas", str(flat_df["Empresa"].nunique()), "Com pelo menos uma vaga")
-        with c3:
-            stat("Fontes", str(flat_df["Fonte"].nunique()), "Plataformas ativas na busca")
-        with c4:
-            stat("Remotas", str(int((flat_df["Remoto?"] == "Sim").sum())), "Somente vagas marcadas como remotas")
-
-        csv_bytes = flat_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            flat_df.to_excel(writer, index=False)
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "Baixar CSV",
-                data=csv_bytes,
-                file_name="vagas_dados_unificadas.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with d2:
-            st.download_button(
-                "Baixar Excel",
-                data=excel_buffer.getvalue(),
-                file_name="vagas_dados_unificadas.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-        feed_tab, table_tab = st.tabs(["Feed", "Tabela completa"])
-        with feed_tab:
-            show_cards(flat_df)
-        with table_tab:
-            st.dataframe(flat_df, hide_index=True, use_container_width=True, column_config={"Link": st.column_config.LinkColumn("Link", display_text="Abrir vaga")})
+    render_live_results_fragment(config.location_terms, config.include_unknown_locations)
 
 
 if __name__ == "__main__":
