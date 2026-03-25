@@ -1026,6 +1026,8 @@ def apply_theme() -> None:
         .legend-item { display:flex; align-items:center; gap:.5rem; font-size:.9rem; color: var(--muted); }
         .legend-item strong { color: var(--ink); font-weight: 700; margin-left: .25rem; }
         .legend-swatch { width: 12px; height: 12px; border-radius: 4px; display: inline-block; }
+        label[data-testid="stWidgetLabel"] span { color: var(--ink); font-weight: 600; }
+        small[data-testid="stHelpInline"] { color: var(--muted); }
         .card { padding: 1rem 1.1rem; min-height: 110px; }
         .label { color: #7d8894; text-transform: uppercase; letter-spacing: .12em; font-size: .72rem; }
         .value { color: var(--ink); font-size: 1.65rem; font-weight: 700; }
@@ -1041,10 +1043,12 @@ def apply_theme() -> None:
         .meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:.75rem; margin-top:.7rem; }
         .meta strong { display:block; color:#7a8794; text-transform:uppercase; font-size:.72rem; letter-spacing:.08em; margin-bottom:.1rem; }
         div[data-testid="stTextArea"], div[data-testid="stMultiSelect"], div[data-testid="stNumberInput"], div[data-testid="stSelectbox"], div[data-testid="stSlider"], div[data-testid="stTextInput"] {
-            background: rgba(255,255,255,.7);
+            background: rgba(255,255,255,.85);
             border-radius: 18px;
             padding: .25rem;
+            box-shadow: inset 0 0 0 1px rgba(20,34,46,0.08);
         }
+        textarea, input { color: var(--ink); }
         button[kind="primary"] { background: var(--accent); border: none; }
         button[kind="primary"]:hover { background: #d95729; }
         </style>
@@ -1190,47 +1194,45 @@ def app() -> None:
     quickin_options = cleaned_company_options(QUICKIN_COMPANIES + st.session_state.get("quickin_selected_widget", []))
     inhire_options = cleaned_company_options(INHIRE_COMPANIES + st.session_state.get("inhire_selected_widget", []))
 
-    st.markdown('<section class="control-shell">', unsafe_allow_html=True)
-    st.markdown(
-        "<div class='section-title'>Configurar busca</div>"
-        "<div class='section-subtitle'>Adicione empresas com o alias/slug do board (na URL). Nomes comerciais nao funcionam.</div>",
-        unsafe_allow_html=True,
-    )
-    with st.form("search_form"):
-        top_left, top_right = st.columns([1.1, 1.35])
-        with top_left:
-            sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "Quickin", "InHire"], key="sources_widget")
-            only_remote = st.toggle("Apenas vagas remotas", key="only_remote_widget")
-            gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, key="gupy_pages_widget")
-            inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, step=1000, key="inhire_timeout_widget")
-            include_unknown_locations = st.toggle("Incluir localizacao N/A no filtro", key="include_unknown_locations_widget")
-            st.caption("A Gupy agora so considera vagas publicadas em 2026 ou depois.")
-            st.caption("No InHire, vagas sem info de remoto continuam aparecendo com modalidade N/A.")
-        with top_right:
-            include_raw = st.text_area("Termos de inclusao", height=110, key="include_raw_widget")
-            exclude_raw = st.text_area("Termos de exclusao", height=110, key="exclude_raw_widget")
-            location_raw = st.text_input("Filtro de localidade", key="location_raw_widget", help="Ex.: sao paulo, remoto, brasilia, rio de janeiro")
+    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+    with st.expander("Configurar busca", expanded=True):
+        st.markdown("<div class='section-title'>Settings</div>", unsafe_allow_html=True)
+        st.markdown('<section class="control-shell">', unsafe_allow_html=True)
+        with st.form("search_form"):
+            top_left, top_right = st.columns([1.1, 1.35])
+            with top_left:
+                sources = st.multiselect("Fontes", ["Greenhouse", "Gupy", "Quickin", "InHire"], key="sources_widget")
+                only_remote = st.toggle("Apenas vagas remotas", key="only_remote_widget")
+                gupy_pages = st.slider("Paginas por termo na Gupy", 1, 8, key="gupy_pages_widget")
+                inhire_timeout_ms = st.slider("Timeout por empresa no InHire (ms)", 5000, 30000, step=1000, key="inhire_timeout_widget")
+                include_unknown_locations = st.toggle("Incluir localizacao N/A no filtro", key="include_unknown_locations_widget")
+                st.caption("A Gupy agora so considera vagas publicadas em 2026 ou depois.")
+                st.caption("No InHire, vagas sem info de remoto continuam aparecendo com modalidade N/A.")
+            with top_right:
+                include_raw = st.text_area("Termos de inclusao", height=110, key="include_raw_widget")
+                exclude_raw = st.text_area("Termos de exclusao", height=110, key="exclude_raw_widget")
+                location_raw = st.text_input("Filtro de localidade", key="location_raw_widget", help="Ex.: sao paulo, remoto, brasilia, rio de janeiro")
 
-        boards_tab, quickin_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas Quickin", "Empresas InHire"])
-        with boards_tab:
-            greenhouse_selected = st.multiselect("Selecione os boards", greenhouse_options, key="greenhouse_selected_widget")
-            st.caption("Para adicionar mais empresas, use o alias/slug do board, nao apenas o nome da empresa. Pode separar por virgula, ponto e virgula ou quebra de linha.")
-            greenhouse_add_raw = st.text_area("Adicionar boards manualmente", height=80, help="Ex.: nubank, ifoodcarreiras, stone", key="greenhouse_add_raw_widget")
-        with quickin_tab:
-            quickin_selected = st.multiselect("Selecione as empresas", quickin_options, key="quickin_selected_widget")
-            st.caption("Use o alias da empresa no Quickin, como aparece na URL do board. Pode separar por virgula, ponto e virgula ou quebra de linha.")
-            quickin_add_raw = st.text_area("Adicionar empresas Quickin", height=80, help="Ex.: startse, topmind, registradores", key="quickin_add_raw_widget")
-        with inhire_tab:
-            inhire_selected = st.multiselect("Selecione as empresas", inhire_options, key="inhire_selected_widget")
-            st.caption("Use o alias da empresa no InHire, igual ao subdominio do board. Pode separar por virgula, ponto e virgula ou quebra de linha.")
-            inhire_add_raw = st.text_area("Adicionar empresas InHire", height=80, help="Ex.: olist, sympla, contabilizei", key="inhire_add_raw_widget")
+            boards_tab, quickin_tab, inhire_tab = st.tabs(["Boards Greenhouse", "Empresas Quickin", "Empresas InHire"])
+            with boards_tab:
+                greenhouse_selected = st.multiselect("Selecione os boards", greenhouse_options, key="greenhouse_selected_widget")
+                st.caption("Para adicionar mais empresas, use o alias/slug do board, nao apenas o nome da empresa. Pode separar por virgula, ponto e virgula ou quebra de linha.")
+                greenhouse_add_raw = st.text_area("Adicionar boards manualmente", height=80, help="Ex.: nubank, ifoodcarreiras, stone", key="greenhouse_add_raw_widget")
+            with quickin_tab:
+                quickin_selected = st.multiselect("Selecione as empresas", quickin_options, key="quickin_selected_widget")
+                st.caption("Use o alias da empresa no Quickin, como aparece na URL do board. Pode separar por virgula, ponto e virgula ou quebra de linha.")
+                quickin_add_raw = st.text_area("Adicionar empresas Quickin", height=80, help="Ex.: startse, topmind, registradores", key="quickin_add_raw_widget")
+            with inhire_tab:
+                inhire_selected = st.multiselect("Selecione as empresas", inhire_options, key="inhire_selected_widget")
+                st.caption("Use o alias da empresa no InHire, igual ao subdominio do board. Pode separar por virgula, ponto e virgula ou quebra de linha.")
+                inhire_add_raw = st.text_area("Adicionar empresas InHire", height=80, help="Ex.: olist, sympla, contabilizei", key="inhire_add_raw_widget")
 
-        left, right = st.columns([1, 2])
-        with left:
-            clicked = st.form_submit_button("Buscar vagas agora", type="primary", use_container_width=True)
-        with right:
-            st.caption("Os resultados entram em tela conforme cada fonte termina. No InHire, a alimentacao acontece empresa por empresa.")
-    st.markdown("</section>", unsafe_allow_html=True)
+            left, right = st.columns([1, 2])
+            with left:
+                clicked = st.form_submit_button("Buscar vagas agora", type="primary", use_container_width=True)
+            with right:
+                st.caption("Os resultados entram em tela conforme cada fonte termina. No InHire, a alimentacao acontece empresa por empresa.")
+        st.markdown("</section>", unsafe_allow_html=True)
 
     greenhouse_companies = merge_company_selection(greenhouse_selected, greenhouse_add_raw)
     quickin_companies = merge_company_selection(quickin_selected, quickin_add_raw)
